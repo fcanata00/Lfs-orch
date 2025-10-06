@@ -11,6 +11,14 @@ IFS=$'\n\t'
 # -------------------- Defaults & Global config --------------------
 DEFAULT_CONFIG="/etc/porg/porg.conf"
 PORG_CONFIG="${PORG_CONFIG:-$DEFAULT_CONFIG}"
+# Source no módulo loger
+source /usr/lib/porg/porg_logger.sh
+log_init "/var/log/porg"           # opcional: passa diretório ou arquivo
+log_section "Build start: $PKG_ID"
+log "INFO" "Iniciando build..."
+# para medir: log_perf make -j8
+# para spinner: log_spinner "Building" "$bg_pid"
+# para progress: log_progress 45 "Downloading" 120
 
 # defaults (overridden by porg.conf)
 PORTS_DIR="/usr/ports"
