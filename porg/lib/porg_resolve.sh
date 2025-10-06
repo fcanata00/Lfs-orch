@@ -1,567 +1,678 @@
 #!/usr/bin/env bash
 #
-# porg-resolve
-# revdep + depclean unified resolver for Porg
-#
-# Local: /usr/lib/porg/porg-resolve  (ou /usr/local/bin/porg-resolve)
-# chmod +x /usr/lib/porg/porg-resolve
+# porg_resolve.sh - revdep + depclean + rebuild resolver for Porg
+# Path suggestion: /usr/lib/porg/resolve.sh or /usr/bin/porg-resolve
 #
 set -euo pipefail
 IFS=$'\n\t'
 
-# -------------------- Defaults / Paths (overridable via env or /etc/porg/porg.conf) --------------------
+# --------------------- Load porg.conf early ---------------------
 PORG_CONF="${PORG_CONF:-/etc/porg/porg.conf}"
-LOGGER_SCRIPT="${LOGGER_SCRIPT:-/usr/lib/porg/porg_logger.sh}"
-DB_SCRIPT="${DB_SCRIPT:-/usr/lib/porg/porg_db.sh}"
-DEPS_PY="${DEPS_PY:-/usr/lib/porg/deps.py}"
-REMOVE_SCRIPT="${REMOVE_SCRIPT:-/usr/lib/porg/porg_remove.sh}"
-BUILDER_CMD="${BUILDER_CMD:-porg}"                    # prefer 'porg' wrapper if present
-BUILDER_SCRIPT="${BUILDER_SCRIPT:-/usr/lib/porg/porg_builder.sh}"
+if [ -f "$PORG_CONF" ]; then
+  # shellcheck disable=SC1090
+  source "$PORG_CONF"
+fi
+
+# --------------------- Defaults (respected if not in porg.conf) ---------------------
 PORTS_DIR="${PORTS_DIR:-/usr/ports}"
-LOG_DIR="${LOG_DIR:-/var/log/porg}"
-REPORT_DIR="${REPORT_DIR:-${LOG_DIR}}"
+INSTALLED_DB="${INSTALLED_DB:-${DB_DIR:-/var/lib/porg/db}/installed.json}"
+LOGGER_SCRIPT="${LOGGER_MODULE:-/usr/lib/porg/porg_logger.sh}"
+DEPS_PY="${DEPS_PY:-/usr/lib/porg/porg_deps.py}"
+BUILDER_SCRIPT="${BUILDER_SCRIPT:-/usr/lib/porg/porg_builder.sh}"
+REMOVE_SCRIPT="${REMOVE_MODULE:-/usr/lib/porg/porg_remove.sh}"
+REPORT_DIR="${REPORT_DIR:-/var/log/porg/reports}"
+CACHE_DIR="${CACHE_DIR:-/var/cache/porg}"
+CHROOT_METHOD="${CHROOT_METHOD:-bwrap}"
+JOBS_DEFAULT="${PARALLEL_BUILDS:-true}"
+JOBS="${1:-$(nproc 2>/dev/null || echo 1)}"
+mkdir -p "$REPORT_DIR" "$CACHE_DIR" "$(dirname "$INSTALLED_DB")"
 
-# runtime flags (defaults)
-DRY_RUN=false
-QUIET=false
-AUTO_YES=false
-PARALLEL="$(nproc 2>/dev/null || echo 1)"
-JSON=false
-
-# behavior flags
-DO_SCAN=false
-DO_FIX=false
-DO_CLEAN=false
-TARGET_PKG=""
-
-# report accumulators
-REPORT_TMP="$(mktemp /tmp/porg-resolve-report.XXXXXX)"
-REPORT_JSON_TMP="$(mktemp /tmp/porg-resolve-json.XXXXXX)"
-trap 'rm -f "$REPORT_TMP" "$REPORT_JSON_TMP"' EXIT
-
-# ensure directories
-mkdir -p "$LOG_DIR" "$REPORT_DIR"
-
-# -------------------- load porg.conf KEY=VAL simple --------------------
-_load_porg_conf() {
-  [ -f "$PORG_CONF" ] || return 0
-  while IFS= read -r raw || [ -n "$raw" ]; do
-    line="${raw%%#*}"
-    line="${line%$'\r'}"
-    [ -z "$line" ] && continue
-    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-      eval "$line"
-    fi
-  done < "$PORG_CONF"
+# --------------------- Logger wrapper ---------------------
+_log_cmd() {
+  local level="$1"; shift
+  local msg="$*"
+  if [ -f "$LOGGER_SCRIPT" ]; then
+    # call the logger if available; non-fatal
+    bash -lc "source '$LOGGER_SCRIPT' >/dev/null 2>&1 || true; if declare -f log_${level,,} >/dev/null 2>&1; then log_${level,,} \"${msg//\"/\\\"}\"; else echo \"[$level] $msg\"; fi" || true
+  else
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    case "$level" in
+      INFO)  printf "%s [INFO] %s\n" "$ts" "$msg" ;;
+      WARN)  printf "%s [WARN] %s\n" "$ts" "$msg" >&2 ;;
+      ERROR) printf "%s [ERROR] %s\n" "$ts" "$msg" >&2 ;;
+      DEBUG) [ "${DEBUG:-false}" = true ] && printf "%s [DEBUG] %s\n" "$ts" "$msg" ;;
+      STAGE) printf "%s [STAGE] %s\n" "$ts" "$msg" ;;
+      *) printf "%s [%s] %s\n" "$ts" "$level" "$msg" ;;
+    esac
+  fi
 }
-_load_porg_conf
 
-# -------------------- source logger & db if available --------------------
-if [ -f "$LOGGER_SCRIPT" ]; then
-  # shellcheck disable=SC1090
-  source "$LOGGER_SCRIPT"
-else
-  log_init() { :; }
-  log() { local lvl="$1"; shift; printf "[%s] %s\n" "$lvl" "$*"; }
-  log_section() { printf "=== %s ===\n" "$*"; }
-fi
+log_info()  { _log_cmd INFO "$*"; }
+log_warn()  { _log_cmd WARN "$*"; }
+log_error() { _log_cmd ERROR "$*"; }
+log_debug() { [ "${DEBUG:-false}" = true ] && _log_cmd DEBUG "$*"; }
+log_stage() { _log_cmd STAGE "$*"; }
 
-if [ -f "$DB_SCRIPT" ]; then
-  # shellcheck disable=SC1090
-  source "$DB_SCRIPT"
-else
-  # provide minimal db helpers using INSTALLED_DB default
-  INSTALLED_DB="${INSTALLED_DB:-/var/db/porg/installed.json}"
-  _db_ensure() { [ -f "$INSTALLED_DB" ] || printf '{}' > "$INSTALLED_DB"; }
-  db_list() {
-    _db_ensure
-    python3 - <<PY
-import json,sys
-p=sys.argv[1]
-try:
-  db=json.load(open(p,'r',encoding='utf-8'))
-except:
-  db={}
-for k,v in db.items():
-  print(k)
-PY
-    "$INSTALLED_DB"
-  }
-  db_info() {
-    _db_ensure
-    python3 - <<PY
-import json,sys
-p=sys.argv[1]; q=sys.argv[2]
-try:
-  db=json.load(open(p,'r',encoding='utf-8'))
-  v=db.get(q)
-  if v is None:
-    sys.exit(1)
-  print(json.dumps(v,ensure_ascii=False))
-except:
-  sys.exit(2)
-PY
-    "$INSTALLED_DB" "$1"
-  }
-fi
-
-# -------------------- helpers --------------------
+# --------------------- CLI/flags ---------------------
 usage() {
   cat <<EOF
-Usage: porg-resolve [options]
+Usage: $(basename "$0") [options]
 Options:
-  --scan             : scan system for broken deps and orphans
-  --fix              : attempt to repair (reinstall) broken packages
-  --clean            : remove orphaned packages (safe)
-  --all              : scan + fix + clean
-  --pkg <pkg>        : operate only on a single package
-  --dry-run          : do not perform destructive actions
-  --parallel <N>     : number of parallel jobs (default: nproc)
-  --quiet            : minimal output (logs still written)
-  --yes              : auto-confirm prompts
-  --json             : emit JSON report alongside human report
-  -h|--help
+  --scan               Scan for broken libraries and orphans
+  --fix                Attempt to rebuild/fix broken packages
+  --clean              Remove orphaned packages (depclean)
+  --rebuild-needed     Show or rebuild packages that need rebuild (uses deps.py)
+  --all                Run full pipeline: scan -> fix -> clean -> rebuild-needed
+  --json               Output machine-readable JSON report in REPORT_DIR
+  --dry-run            Do not modify system; simulate actions
+  --quiet              Minimal stdout (logs still recorded)
+  --yes                Auto-confirm destructive actions
+  --parallel N         Run up to N parallel rebuilds (default: nproc)
+  --chroot             Force using chroot/bwrap for rebuilds
+  -h, --help           Show this help
 EOF
+  exit 1
 }
 
-# parse CLI
-if [ "$#" -eq 0 ]; then usage; exit 1; fi
-while [ "$#" -gt 0 ]; do
+CMD_SCAN=false; CMD_FIX=false; CMD_CLEAN=false; CMD_REBUILD=false; CMD_ALL=false
+DRY_RUN=false; QUIET=false; AUTO_YES=false; OUT_JSON=false; FORCE_CHROOT=false
+PARALLEL_N="$(nproc 2>/dev/null || echo 1)"
+
+while [ $# -gt 0 ]; do
   case "$1" in
-    --scan) DO_SCAN=true; shift ;;
-    --fix) DO_FIX=true; shift ;;
-    --clean) DO_CLEAN=true; shift ;;
-    --all) DO_SCAN=true; DO_FIX=true; DO_CLEAN=true; shift ;;
-    --pkg) TARGET_PKG="${2:-}"; shift 2 ;;
-    --dry-run) DRY_RUN=true; shift ;;
-    --parallel) PARALLEL="${2:-$PARALLEL}"; shift 2 ;;
-    --quiet) QUIET=true; shift ;;
-    --yes) AUTO_YES=true; shift ;;
-    --json) JSON=true; shift ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "Unknown option: $1"; usage; exit 2 ;;
+    --scan) CMD_SCAN=true; shift;;
+    --fix) CMD_FIX=true; shift;;
+    --clean) CMD_CLEAN=true; shift;;
+    --rebuild-needed) CMD_REBUILD=true; shift;;
+    --all) CMD_ALL=true; shift;;
+    --json) OUT_JSON=true; shift;;
+    --dry-run) DRY_RUN=true; shift;;
+    --quiet) QUIET=true; shift;;
+    --yes) AUTO_YES=true; shift;;
+    --parallel) PARALLEL_N="${2:-$PARALLEL_N}"; shift 2;;
+    --chroot) FORCE_CHROOT=true; shift;;
+    -h|--help) usage;;
+    *) echo "Unknown option: $1"; usage;;
   esac
 done
 
-# default to scan if nothing requested
-if [ "$DO_SCAN" = false ] && [ "$DO_FIX" = false ] && [ "$DO_CLEAN" = false ]; then
-  DO_SCAN=true
-fi
+if [ "$QUIET" = true ]; then export QUIET_MODE_DEFAULT=true; fi
 
-# small wrapper of log respecting --quiet
-_log() {
-  local lvl="$1"; shift
-  if [ "$QUIET" = true ] && [ "$lvl" != "ERROR" ]; then
-    # quiet: still write to session file via log() but suppress stdout if logger prints
-    # call logger but don't print to stdout for non-error
-    if declare -f log >/dev/null 2>&1; then
-      # log() will handle writing; but to suppress extra printing rely on logger QUIET var
-      log "$lvl" "$*"
-    else
-      printf "[%s] %s\n" "$lvl" "$*" >> "$REPORT_TMP"
-    fi
-  else
-    log "$lvl" "$*"
-  fi
-}
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+REPORT_JSON="${REPORT_DIR}/resolve-report-${TS}.json"
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}"/porg-resolve.XXXX)"
+trap 'rm -rf "$TMPDIR"' EXIT
 
-# find metafile for a package (search PORTS_DIR)
-find_metafile_for() {
-  local pkg="$1"
-  # prefer <ports>/<cat>/<pkg> directory
-  if [ -d "$PORTS_DIR" ]; then
-    for cat in "$PORTS_DIR"/*; do
-      [ -d "$cat" ] || continue
-      if [ -d "$cat/$pkg" ]; then
-        # pick first yaml file inside
-        mf=$(ls -1 "$cat/$pkg"/*.{yml,yaml} 2>/dev/null | head -n1 || true)
-        [ -n "$mf" ] && { echo "$mf"; return 0; }
-      fi
-    done
-    # fallback walk
-    mf=$(find "$PORTS_DIR" -type f -iname "${pkg}*.y*ml" -print -quit 2>/dev/null || true)
-    [ -n "$mf" ] && { echo "$mf"; return 0; }
-  fi
-  return 1
-}
-
-# call deps.py to get resolved order or missing list
-deps_resolve_order() {
-  local pkg="$1"
-  if [ -x "$DEPS_PY" ]; then
-    python3 "$DEPS_PY" resolve "$pkg" 2>/dev/null || true
-  else
-    # best-effort: return pkg only
-    printf '{"package":"%s","order":["%s"]}' "$pkg" "$pkg"
-  fi
-}
-
-deps_missing() {
-  local pkg="$1"
-  if [ -x "$DEPS_PY" ]; then
-    python3 "$DEPS_PY" missing "$pkg" 2>/dev/null || true
-  else
-    printf '{"package":"%s","missing":[]}' "$pkg"
-  fi
-}
-
-# check single package integrity:
-# - db_info must exist
-# - prefix must exist
-# - run ldd on ELF files under prefix/bin and prefix/lib to detect "not found"
-check_pkg_integrity() {
-  local pkg="$1"
-  local info
-  info="$(db_info "$pkg" 2>/dev/null || true)"
-  if [ -z "$info" ]; then
-    echo "MISSING_DB"
-    return 0
-  fi
-  # extract prefix
-  local prefix
-  prefix="$(echo "$info" | python3 -c "import sys,json;print(json.load(sys.stdin).get('prefix',''))" 2>/dev/null || echo "")"
-  if [ -z "$prefix" ]; then
-    echo "NO_PREFIX"
-    return 0
-  fi
-  if [ ! -d "$prefix" ]; then
-    echo "MISSING_PREFIX"
-    return 0
-  fi
-  # look for ELF files in bin/lib/lib64
-  local missing_libs=0
-  while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    # ldd may fail on scripts; ignore errors; search for "not found"
-    if ldd "$f" 2>/dev/null | grep -q "not found"; then
-      missing_libs=$((missing_libs+1))
-    fi
-  done < <(find "$prefix" -type f \( -path "$prefix/bin/*" -o -path "$prefix/sbin/*" -o -path "$prefix/lib/*" -o -path "$prefix/lib64/*" \) -executable -print 2>/dev/null || true)
-  if [ "$missing_libs" -gt 0 ]; then
-    echo "BROKEN_LDD"
-  else
-    echo "OK"
-  fi
-}
-
-# collect list of installed packages (optionally single package)
-list_installed_pkgs() {
-  if [ -n "$TARGET_PKG" ]; then
-    echo "$TARGET_PKG"
-    return 0
-  fi
-  # try db_list (sourced) else fallback
-  if declare -f db_list >/dev/null 2>&1; then
-    db_list | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$'
-  else
-    INSTALLED_DB="${INSTALLED_DB:-/var/db/porg/installed.json}"
-    python3 - <<PY
-import sys,json
-p=sys.argv[1]
-try:
-  db=json.load(open(p,'r',encoding='utf-8'))
-except:
-  db={}
-for k in db.keys():
-  print(k)
-PY
-    "$INSTALLED_DB"
-  fi
-}
-
-# build (reinstall) a single package
-fix_package() {
-  local pkg="$1"
-  _log INFO "Attempting to rebuild/reinstall package: $pkg"
-  if [ "$DRY_RUN" = true ]; then
-    _log INFO "[dry-run] would reinstall $pkg (builder)"
-    echo "FIX-DRY:$pkg" >> "$REPORT_TMP"
-    return 0
-  fi
-
-  # prefer 'porg' wrapper if present
-  if command -v porg >/dev/null 2>&1; then
-    _log INFO "Invoking: porg -i $pkg"
-    if porg -i "$pkg"; then
-      _log INFO "Reinstall succeeded: $pkg"
-      echo "FIXED:$pkg" >> "$REPORT_TMP"
-      return 0
-    else
-      _log WARN "porg -i $pkg failed"
-    fi
-  fi
-
-  # fallback: try to find metafile and call builder script
-  if [ -x "$BUILDER_SCRIPT" ]; then
-    mf="$(find_metafile_for "$pkg" || true)"
-    if [ -n "$mf" ]; then
-      _log INFO "Using builder script: $BUILDER_SCRIPT build $mf"
-      if "$BUILDER_SCRIPT" build "$mf"; then
-        _log INFO "Rebuild succeeded via builder script for $pkg"
-        echo "FIXED:$pkg" >> "$REPORT_TMP"
-        return 0
-      else
-        _log WARN "Builder script failed for $pkg"
-      fi
-    else
-      _log WARN "Metafile not found for $pkg; cannot call builder script automatically"
-    fi
-  fi
-
-  # as last resort, try apt/dnf/pacman? (not implemented) — mark as failed
-  _log ERROR "Unable to automatically rebuild $pkg; manual intervention required"
-  echo "FAILED:$pkg" >> "$REPORT_TMP"
-  return 2
-}
-
-# remove orphan via remove script
-remove_orphan() {
-  local pkg="$1"
-  _log INFO "Removing orphan package: $pkg"
-  if [ "$DRY_RUN" = true ]; then
-    _log INFO "[dry-run] Would call remove script for $pkg"
-    echo "ORPHAN-DRY:$pkg" >> "$REPORT_TMP"
-    return 0
-  fi
-  if [ -x "$REMOVE_SCRIPT" ]; then
-    if "$REMOVE_SCRIPT" "$pkg" --yes --force; then
-      _log INFO "Orphan removed: $pkg"
-      echo "REMOVED:$pkg" >> "$REPORT_TMP"
-      return 0
-    else
-      _log WARN "Remove script failed for orphan $pkg"
-      echo "REMOVE-FAILED:$pkg" >> "$REPORT_TMP"
-      return 2
-    fi
-  else
-    # fallback: try db_unregister only
-    if declare -f db_unregister >/dev/null 2>&1; then
-      db_unregister "$pkg" && _log INFO "DB entry removed (orphan): $pkg" && echo "REMOVED-DB:$pkg" >> "$REPORT_TMP" || echo "REMOVE-DB-FAILED:$pkg" >> "$REPORT_TMP"
-      return 0
-    fi
-    _log WARN "No remove script found; cannot remove orphan $pkg safely"
-    echo "ORPHAN-SKIP:$pkg" >> "$REPORT_TMP"
-    return 1
-  fi
-}
-
-# revdep scan: find broken packages
-revdep_scan() {
-  _log STAGE "Starting revdep scan"
-  local broken_list_file
-  broken_list_file="$(mktemp)"
-  touch "$broken_list_file"
-  for pkg in $(list_installed_pkgs); do
-    # check integrity
-    status="$(check_pkg_integrity "$pkg")"
-    case "$status" in
-      OK) _log DEBUG "OK: $pkg" ;;
-      MISSING_DB) _log WARN "Missing DB entry for $pkg"; echo "$pkg|MISSING_DB" >> "$broken_list_file" ;;
-      NO_PREFIX) _log WARN "No prefix recorded for $pkg"; echo "$pkg|NO_PREFIX" >> "$broken_list_file" ;;
-      MISSING_PREFIX) _log WARN "Prefix missing for $pkg"; echo "$pkg|MISSING_PREFIX" >> "$broken_list_file" ;;
-      BROKEN_LDD) _log WARN "Broken (ldd) libs for $pkg"; echo "$pkg|BROKEN_LDD" >> "$broken_list_file" ;;
-      *) _log WARN "Unknown status ($status) for $pkg"; echo "$pkg|$status" >> "$broken_list_file" ;;
-    esac
-  done
-  # produce report
-  if [ -s "$broken_list_file" ]; then
-    _log WARN "revdep scan found broken packages:"
-    cat "$broken_list_file" | sed 's/^/  /' | tee -a "$REPORT_TMP"
-  else
-    _log INFO "revdep scan: no broken packages found"
-  fi
-  awk -F'|' '{print $1}' "$broken_list_file" > "${broken_list_file}.pkgs"
-  # write list to REPORT_TMP
-  while IFS= read -r p; do [ -n "$p" ] && echo "BROKEN:$p" >> "$REPORT_TMP"; done < "${broken_list_file}.pkgs"
-  # output file path for further steps
-  printf "%s\n" "${broken_list_file}.pkgs"
-}
-
-# depclean scan: find orphaned packages
-depclean_scan() {
-  _log STAGE "Starting depclean scan (orphans)"
-  # Read installed DB and build reverse map
-  python3 - <<PY > /tmp/porg_resolve_orphans.$$ 2>/dev/null
+# --------------------- Helpers: JSON read/write (jq or python) ---------------------
+_have_jq() { command -v jq >/dev/null 2>&1; }
+_json_read() {
+  # $1 = file, prints to stdout
+  if _have_jq; then jq -C . "$1"; else python3 - <<PY
 import json,sys
-p=sys.argv[1]
+print(json.dumps(json.load(open(sys.argv[1],'r',encoding='utf-8')),ensure_ascii=False,indent=2))
+PY
+  fi
+}
+
+# --------------------- Backup DB ---------------------
+backup_installed_db() {
+  local bdir="${DB_BACKUP_DIR:-/var/backups/porg/db}"
+  mkdir -p "$bdir"
+  local out="${bdir}/installed.json.bak.${TS}"
+  cp -a "$INSTALLED_DB" "$out" 2>/dev/null || true
+  log_info "Backup of installed DB to $out"
+  echo "$out"
+}
+
+# --------------------- Read installed DB list ---------------------
+read_installed_pkgs() {
+  if [ ! -f "$INSTALLED_DB" ]; then
+    echo "[]" ; return
+  fi
+  if _have_jq; then
+    jq -r 'to_entries[] | .value.name' "$INSTALLED_DB" 2>/dev/null || true
+  else
+    python3 - <<PY
+import json,sys
 try:
-  db=json.load(open(p,'r',encoding='utf-8'))
+  db=json.load(open("$INSTALLED_DB",'r',encoding='utf-8'))
 except:
   db={}
-deps_map={}
 for k,v in db.items():
-  deps=v.get('deps') or []
-  for d in deps:
-    deps_map.setdefault(d, set()).add(k)
+  print(v.get('name') or k)
+PY
+  fi
+}
+
+# --------------------- revdep_scan: find "not found" in ldd for ELF files under package prefix ---------------------
+revdep_scan() {
+  log_stage "Starting revdep_scan"
+  local results_file="${TMPDIR}/revdep.json"
+  echo "{\"broken\":[]}" > "$results_file"
+  local broken_pkgs=()
+  # loop installed entries with prefixes
+  if [ ! -f "$INSTALLED_DB" ]; then
+    log_warn "Installed DB not found at $INSTALLED_DB; skipping revdep_scan"
+    echo "{\"broken\":[]}" > "$results_file"
+    cat "$results_file"
+    return 0
+  fi
+  # gather packages with prefixes
+  python3 - <<PY > "${TMPDIR}/pkg_prefixes.json"
+import json,sys
+try:
+  db=json.load(open("$INSTALLED_DB",'r',encoding='utf-8'))
+except:
+  db={}
+out=[]
+for k,v in db.items():
+  prefix=v.get('prefix') or '/'
+  name=v.get('name') or k
+  out.append({"key":k,"name":name,"prefix":prefix})
+print(json.dumps(out))
+PY
+
+  # for each package, search common dirs (bin, lib, sbin, usr) under prefix for ELF files
+  mapfile -t pkg_lines < <(python3 - <<PY
+import json,sys
+data=json.load(open("${TMPDIR}/pkg_prefixes.json",'r',encoding='utf-8'))
+for e in data:
+    print(e["name"]+"|||"+e["prefix"])
+PY
+)
+  idx=0
+  total=${#pkg_lines[@]}
+  for pl in "${pkg_lines[@]}"; do
+    idx=$((idx+1))
+    pkg="${pl%%%*}" # will not be used; safer parsing below
+    IFS='|||' read -r pkg prefix <<< "$pl"
+    prefix="${prefix:-/}"
+    # check candidate directories
+    dirs=( "${prefix}/bin" "${prefix}/sbin" "${prefix}/lib" "${prefix}/lib64" "${prefix}/usr/lib" "${prefix}/usr/lib64" "${prefix}/usr/bin" )
+    pkg_broken=false
+    # iterate files
+    for d in "${dirs[@]}"; do
+      [ -d "$d" ] || continue
+      # find ELF regular files
+      while IFS= read -r -d '' f; do
+        # skip symlinks (we'll check their targets separately)
+        if file "$f" 2>/dev/null | grep -q 'ELF'; then
+          # inspect ldd output
+          out=$(ldd "$f" 2>/dev/null || true)
+          if echo "$out" | grep -q "not found"; then
+            pkg_broken=true
+            # record
+            python3 - <<PY
+import json,sys
+r=json.load(open("${results_file}","r",encoding='utf-8'))
+if "broken" not in r: r["broken"]=[]
+r["broken"].append({"pkg":"$pkg","file":"$f","ldd":"""$out"""})
+open("${results_file}","w",encoding='utf-8').write(json.dumps(r,indent=2,ensure_ascii=False))
+PY
+            # break to next package (to reduce noise)
+            break 2
+          fi
+        fi
+      done < <(find "$d" -type f -print0 2>/dev/null)
+    done
+  done
+
+  cat "$results_file"
+}
+
+# --------------------- depclean_scan: find orphaned packages (no reverse-deps) ---------------------
+depclean_scan() {
+  log_stage "Starting depclean_scan"
+  local results_file="${TMPDIR}/depclean.json"
+  echo "{\"orphans\":[]}" > "$results_file"
+  # prefer to use porg_deps.py to compute reverse dependencies
+  if [ -x "$DEPS_PY" ]; then
+    log_debug "Calling $DEPS_PY to build world graph"
+    # ask for an upgrade-plan for world to get dependencies graph
+    plan_json="$("$DEPS_PY" upgrade-plan --world 2>/dev/null || true)"
+    if [ -z "$plan_json" ]; then
+      log_warn "deps.py did not return upgrade-plan; fallback to lightweight detection"
+    else
+      # parse graph: if a package appears in installed DB but never appears as dependency of any other, it's candidate orphan
+      if _have_jq; then
+        installed_list=$(jq -r '(.roots // []) as $r | .upgrade_order[]' <<<"$plan_json" 2>/dev/null || true)
+        # Build reverse map: for performance, use python
+        python3 - <<PY > "$results_file"
+import json,sys
+plan=json.loads(sys.stdin.read())
+order=plan.get("upgrade_order",[]) or []
+# build dependencies map by reading meta via porg_deps is expensive; we approximate using order: if package never appears as dep in graph edges, mark as orphan candidate
+# but plan may not contain explicit edges here; fallback: compute reverse by scanning metafiles in /usr/ports
+import os
+ports_dir = os.environ.get("PORTS_DIR","/usr/ports")
+def parse_yaml(p):
+    try:
+        import yaml
+        return yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
+    except:
+        # fallback parsing
+        txt=open(p,'r',encoding='utf-8',errors='ignore').read()
+        return {}
+# collect all packages declared in ports and their dependencies
+deps_map={}
+for root,dirs,files in os.walk(ports_dir):
+    for fn in files:
+        if fn.lower().endswith((".yml",".yaml")):
+            p=os.path.join(root,fn)
+            d=parse_yaml(p)
+            name=d.get("name") or os.path.splitext(fn)[0]
+            deps=[]
+            dd=d.get("dependencies") or {}
+            if isinstance(dd,dict):
+                for k in ("build","runtime","optional"):
+                    v=dd.get(k)
+                    if isinstance(v,list):
+                        deps += v
+            elif isinstance(dd,list):
+                deps += dd
+            deps_map[name]=deps
+# build reverse map
+rev={}
+for k,vals in deps_map.items():
+    for dep in vals:
+        rev.setdefault(dep, set()).add(k)
+# read installed DB
+try:
+    db=json.load(open(os.path.join(os.environ.get("DB_DIR","/var/lib/porg/db"),"installed.json"),'r',encoding='utf-8'))
+except:
+    db={}
+orphans=[]
+for key,v in db.items():
+    name=v.get("name") or key
+    # if no reverse deps and not a core package (heuristic: tier/core omitted), consider orphan
+    if name not in rev or len(rev.get(name,[]))==0:
+        orphans.append({"pkg":name,"prefix":v.get("prefix")})
+print(json.dumps({"orphans":orphans},indent=2,ensure_ascii=False))
+PY
+      fi
+      cat "$results_file"
+      return 0
+    fi
+  fi
+
+  # fallback: naive approach - any installed package not referenced by others in installed DB's 'dependencies' field
+  python3 - <<PY > "$results_file"
+import json,sys
+try:
+  db=json.load(open("$INSTALLED_DB",'r',encoding='utf-8'))
+except:
+  db={}
+# naive: if a package's name never appears in any metafile dependency, consider it orphan candidate
+from os import walk
+ports={}
+for root,dirs,files in walk("$PORTS_DIR"):
+    for f in files:
+        if f.lower().endswith(('.yml','.yaml')):
+            p=root+'/'+f
+            try:
+                import yaml
+                d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
+            except:
+                d={}
+            name=d.get('name') or f.rsplit('.',1)[0]
+            deps=[]
+            dd=d.get('dependencies') or d.get('deps') or {}
+            if isinstance(dd,dict):
+                for k in ('build','runtime','optional'):
+                    v=dd.get(k)
+                    if isinstance(v,list): deps+=v
+            elif isinstance(dd,list):
+                deps+=dd
+            ports[name]=deps
+# build reverse map
+rev={}
+for k,v in ports.items():
+    for dep in v:
+        rev.setdefault(dep,[]).append(k)
 orphans=[]
 for k,v in db.items():
-  # a package is orphan if no package depends on it (consider name base)
-  name=k.split('-')[0]
-  relied=False
-  for dep,owners in deps_map.items():
-    if dep==k or dep.split('-')[0]==name or k in owners:
-      relied=True; break
-  if not relied:
-    # skip protected base/system packages heuristics: skip packages installed to / (prefix '/')
-    prefix=v.get('prefix','')
-    if prefix and prefix not in ('/','/usr') :
-      orphans.append(k)
-print("\n".join(orphans))
+    name=v.get('name') or k
+    if name not in rev or len(rev.get(name,[]))==0:
+        orphans.append({"pkg":name,"prefix":v.get("prefix")})
+print(json.dumps({"orphans":orphans},indent=2,ensure_ascii=False))
 PY
-  INSTALLED_DB="${INSTALLED_DB:-/var/db/porg/installed.json}"
-  python3 - "$INSTALLED_DB" > /tmp/porg_resolve_orphans.$$ 2>/dev/null || true
-  if [ -s /tmp/porg_resolve_orphans.$$ ]; then
-    _log WARN "depclean scan found orphans:"
-    sed 's/^/  - /' /tmp/porg_resolve_orphans.$$ | tee -a "$REPORT_TMP"
-    awk '{print $0}' /tmp/porg_resolve_orphans.$$ > /tmp/porg_resolve_orphans_list.$$
-    printf "%s\n" "/tmp/porg_resolve_orphans_list.$$"
+
+  cat "$results_file"
+}
+
+# --------------------- call porg_deps.py to find rebuild-needed ---------------------
+get_rebuild_needed() {
+  log_stage "Checking rebuild-needed via $DEPS_PY"
+  if [ ! -x "$DEPS_PY" ]; then
+    log_warn "deps.py not found or not executable at $DEPS_PY"
+    echo "[]"
+    return 0
+  fi
+  # call upgrade-plan for world
+  plan="$("$DEPS_PY" upgrade-plan --world 2>/dev/null || true)"
+  if [ -z "$plan" ]; then
+    log_warn "deps.py returned empty plan"
+    echo "[]"
+    return 0
+  fi
+  if _have_jq; then
+    echo "$plan" | jq -r '.needs_rebuild[]?' 2>/dev/null || true
   else
-    _log INFO "depclean: no orphans found"
-    printf "%s\n" ""
+    python3 - <<PY
+import json,sys
+plan=json.loads(sys.stdin.read() or "{}")
+for p in plan.get("needs_rebuild",[]):
+    print(p)
+PY
   fi
 }
 
-# run fixes in parallel
-run_fixes_parallel() {
-  local file="$1"
-  local n="$2"
-  if [ ! -s "$file" ]; then
-    _log INFO "No packages to fix"
+# --------------------- fix_package: try to rebuild a package (respects DRY_RUN, CHROOT) ---------------------
+fix_package() {
+  local pkg="$1"
+  log_info "Attempting to fix/rebuild package: $pkg"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] Would rebuild $pkg"
     return 0
   fi
-  # use xargs to parallelize: pass each pkg line to fix_package
-  if command -v xargs >/dev/null 2>&1; then
-    cat "$file" | xargs -r -n1 -P "$n" -I{} bash -c 'p="{}"; '"$(declare -f _log fix_package >/dev/null 2>&1; echo '_log() { '" ) 2>/dev/null || true
-    # fallback loop if xargs not available:
-    while IFS= read -r p; do fix_package "$p"; done < "$file"
+
+  # try to find metafile
+  mf="$(find "$PORTS_DIR" -type f -iname "${pkg}*.y*ml" -print -quit 2>/dev/null || true)"
+  if [ -z "$mf" ]; then
+    log_warn "Metafile for $pkg not found under $PORTS_DIR; will try porg -i $pkg"
+    if command -v porg >/dev/null 2>&1; then
+      porg -i "$pkg" || log_warn "porg -i $pkg returned non-zero"
+      return $?
+    else
+      log_error "No builder interface found (porg or BUILDER_SCRIPT). Cannot rebuild $pkg"
+      return 2
+    fi
+  fi
+
+  # decide whether to use chroot (bubblewrap) for build
+  if [ "$FORCE_CHROOT" = true ] || ( [ "$CHROOT_METHOD" = "bwrap" ] && command -v bwrap >/dev/null 2>&1 ); then
+    log_debug "Building $pkg inside bwrap chroot"
+    if [ -x "$BUILDER_SCRIPT" ]; then
+      if [ -n "$BUILDER_SCRIPT" ]; then
+        if [ "$DRY_RUN" = true ]; then
+          log_info "[DRY-RUN] builder build $mf"
+        else
+          # call builder in chroot mode if builder supports it; otherwise call builder normally
+          "$BUILDER_SCRIPT" build "$mf" || { log_warn "Builder returned non-zero for $pkg"; return 1; }
+        fi
+      fi
+    else
+      # fallback: use porg -i
+      if command -v porg >/dev/null 2>&1; then
+        porg -i "$pkg" || log_warn "porg -i $pkg returned non-zero"
+      else
+        log_error "No builder available"
+        return 2
+      fi
+    fi
   else
-    while IFS= read -r p; do fix_package "$p"; done < "$file"
+    # non-chroot simple build
+    if [ "$DRY_RUN" = true ]; then
+      log_info "[DRY-RUN] Would build $mf (no chroot)"
+    else
+      if [ -x "$BUILDER_SCRIPT" ]; then
+        "$BUILDER_SCRIPT" build "$mf" || { log_warn "Builder returned non-zero for $pkg"; return 1; }
+      else
+        if command -v porg >/dev/null 2>&1; then
+          porg -i "$pkg" || log_warn "porg -i $pkg returned non-zero"
+        else
+          log_error "No builder available"
+          return 2
+        fi
+      fi
+    fi
+  fi
+  return 0
+}
+
+# --------------------- remove_orphan: removes an orphan package safely ---------------------
+remove_orphan() {
+  local pkg="$1"
+  log_info "Removing orphan: $pkg"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] Would remove $pkg (would call $REMOVE_SCRIPT)"
+    return 0
+  fi
+  # backup DB before removal
+  backup_installed_db
+  if [ -x "$REMOVE_SCRIPT" ]; then
+    "$REMOVE_SCRIPT" "$pkg" --yes --force || log_warn "REMOVE_SCRIPT returned non-zero for $pkg"
+  else
+    # fallback: call porg_db unregister
+    if [ -x "/usr/lib/porg/porg_db.sh" ]; then
+      /usr/lib/porg/porg_db.sh unregister "$pkg" || log_warn "porg_db.sh unregister returned non-zero"
+    else
+      log_warn "No remove script or db script available; manual cleanup required for $pkg"
+    fi
   fi
 }
 
-# clean orphans in parallel
-run_clean_parallel() {
-  local file="$1"
-  local n="$2"
-  if [ ! -s "$file" ]; then
-    _log INFO "No orphans to remove"
+# --------------------- run parallel jobs helper ---------------------
+run_parallel_jobs() {
+  # args are functions to call in background as "cmd:::pkg" or direct commands
+  local -a jobs=("$@")
+  local max="$PARALLEL_N"
+  local running=0
+  local i=0
+  local pids=()
+  for j in "${jobs[@]}"; do
+    eval "$j" & pids+=($!)
+    running=$((running+1))
+    # throttle
+    if [ "$running" -ge "$max" ]; then
+      if command -v wait >/dev/null 2>&1; then
+        if wait -n 2>/dev/null; then
+          running=$((running-1))
+        else
+          # fallback: wait for first pid
+          wait "${pids[0]}" || true
+          running=$((running-1))
+          pids=("${pids[@]:1}")
+        fi
+      else
+        wait "${pids[0]}" || true
+        running=$((running-1))
+        pids=("${pids[@]:1}")
+      fi
+    fi
+  done
+  # wait for remaining
+  wait
+}
+
+# --------------------- Merge scans and produce JSON report ---------------------
+compose_report() {
+  local rev_json="${TMPDIR}/revdep.json"
+  local dep_json="${TMPDIR}/depclean.json"
+  local rebuild_list_file="${TMPDIR}/rebuild.txt"
+  local rebuild_list
+  if [ -f "$rebuild_list_file" ]; then
+    rebuild_list="$(sed -n '1,999p' "$rebuild_list_file" | jq -R -s -c 'split("\n")[:-1]' 2>/dev/null || python3 - <<PY
+import sys,json
+data=open("$rebuild_list_file").read().splitlines()
+print(json.dumps([x for x in data if x.strip()]))
+PY
+)"
+  else
+    rebuild_list="[]"
+  fi
+
+  # read revdep & depclean (if exist)
+  rev_json_content="{}"
+  dep_json_content="{}"
+  [ -f "$rev_json" ] && rev_json_content=$(cat "$rev_json")
+  [ -f "$dep_json" ] && dep_json_content=$(cat "$dep_json")
+
+  # assemble report
+  python3 - <<PY > "$REPORT_JSON"
+import json,sys
+rev=json.loads('''$rev_json_content''')
+dep=json.loads('''$dep_json_content''')
+out={}
+out['timestamp']="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+out['revdep']=rev
+out['depclean']=dep
+try:
+    rebuild = json.loads('''$rebuild_list''' )
+except:
+    rebuild = []
+out['rebuild_needed']=rebuild
+print(json.dumps(out,indent=2,ensure_ascii=False))
+PY
+
+  log_info "Report written to $REPORT_JSON"
+  if [ "$OUT_JSON" = true ]; then
+    cat "$REPORT_JSON"
+  fi
+}
+
+# --------------------- High-level flows ---------------------
+flow_scan() {
+  log_stage "Flow: scan"
+  revdep_scan > "${TMPDIR}/revdep.json"
+  depclean_scan > "${TMPDIR}/depclean.json"
+  # if rebuild mode requested, compute list
+  if [ "$CMD_REBUILD" = true ] || [ "$CMD_ALL" = true ]; then
+    get_rebuild_needed > "${TMPDIR}/rebuild.txt" || true
+  fi
+  compose_report
+}
+
+flow_fix() {
+  log_stage "Flow: fix"
+  # parse revdep.json for broken packages list
+  if [ ! -f "${TMPDIR}/revdep.json" ]; then
+    revdep_scan > "${TMPDIR}/revdep.json"
+  fi
+  # gather unique package names
+  if _have_jq; then
+    pkgs=$(jq -r '.broken[]?.pkg' "${TMPDIR}/revdep.json" 2>/dev/null | sort -u)
+  else
+    pkgs=$(python3 - <<PY
+import json
+try:
+  r=json.load(open("${TMPDIR}/revdep.json",'r',encoding='utf-8'))
+except:
+  r={}
+out=set()
+for e in r.get("broken",[]):
+    out.add(e.get("pkg"))
+for x in sorted(out):
+    print(x)
+PY
+)
+  fi
+  # rebuild packages in parallel with safe throttle
+  local cmds=()
+  for p in $pkgs; do
+    [ -z "$p" ] && continue
+    cmds+=("fix_package '$p'")
+  done
+  if [ "${#cmds[@]}" -eq 0 ]; then
+    log_info "No broken packages detected to fix."
     return 0
   fi
-  while IFS= read -r p; do
-    # run sequentially or in background controlled by PARALLEL
-    # for simplicity, run sequentially but respect DRY_RUN
+  run_parallel_jobs "${cmds[@]}"
+  # refresh and write report
+  revdep_scan > "${TMPDIR}/revdep.json"
+  compose_report
+}
+
+flow_clean() {
+  log_stage "Flow: clean (depclean)"
+  # parse depclean.json to get orphans
+  depclean_scan > "${TMPDIR}/depclean.json"
+  if _have_jq; then
+    orphans=$(jq -r '.orphans[]?.pkg' "${TMPDIR}/depclean.json" 2>/dev/null | sort -u)
+  else
+    orphans=$(python3 - <<PY
+import json
+try:
+  d=json.load(open("${TMPDIR}/depclean.json",'r',encoding='utf-8'))
+except:
+  d={}
+seen=set()
+for e in d.get("orphans",[]):
+  name=e.get("pkg")
+  if name:
+    seen.add(name)
+for x in sorted(seen):
+  print(x)
+PY
+)
+  fi
+  if [ -z "$orphans" ]; then
+    log_info "No orphans detected."
+    return 0
+  fi
+  log_info "Orphans detected: $orphans"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] Would remove orphans: $orphans"
+    return 0
+  fi
+  if [ "$AUTO_YES" != true ]; then
+    printf "Remove orphans? %s [y/N]: " "$orphans"
+    read -r ans || true
+    case "$ans" in y|Y|yes|Yes) ;; *) log_info "Aborting removal."; return 0 ;; esac
+  fi
+  for p in $orphans; do
     remove_orphan "$p"
-  done < "$file"
+  done
+  compose_report
 }
 
-# -------------------- Orchestration functions --------------------
-do_scan_only() {
-  _log STAGE "Running scan-only (revdep + depclean)"
-  broken_list_pkgs="$(revdep_scan)"
-  orphans_list_file="$(depclean_scan)"
-  # prepare human report
-  ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  report_file="${REPORT_DIR}/resolve-report-${ts}.log"
-  {
-    echo "porg-resolve scan report: $ts"
-    echo "--- broken packages ---"
-    [ -n "$broken_list_pkgs" ] && [ -f "$broken_list_pkgs" ] && sed 's/^/  /' "$broken_list_pkgs" || echo "  (none)"
-    echo "--- orphan packages ---"
-    if [ -n "$orphans_list_file" ] && [ -f "$orphans_list_file" ]; then sed 's/^/  /' "$orphans_list_file"; else echo "  (none)"; fi
-  } | tee "$report_file"
-  _log INFO "Report written: $report_file"
-  # create JSON if requested
-  if [ "$JSON" = true ]; then
-    jq -n --argfile b "$broken_list_pkgs" --argfile o "$orphans_list_file" '{broken: ($b // []), orphans: ($o // [])}' > "${report_file}.json" 2>/dev/null || true
-  fi
-}
-
-do_fix_only() {
-  _log STAGE "Running fix-only (attempt to rebuild broken packages)"
-  broken_list_pkgs="$(revdep_scan)"
-  if [ -z "$broken_list_pkgs" ] || [ ! -f "$broken_list_pkgs" ]; then
-    _log INFO "No broken packages detected"
+flow_rebuild_needed() {
+  log_stage "Flow: rebuild-needed"
+  # get rebuild list
+  get_rebuild_needed > "${TMPDIR}/rebuild.txt"
+  mapfile -t rebuilds < <(grep -v '^\s*$' "${TMPDIR}/rebuild.txt" || true)
+  if [ "${#rebuilds[@]}" -eq 0 ]; then
+    log_info "No packages marked as needing rebuild"
     return 0
   fi
-  # fix each package (in parallel)
-  _log INFO "Fixing packages (parallel=$PARALLEL)"
-  run_fixes_parallel "$broken_list_pkgs" "$PARALLEL"
-  _log INFO "Fix stage complete"
-}
-
-do_clean_only() {
-  _log STAGE "Running clean-only (remove orphans)"
-  orphans_file_tmp="$(mktemp)"
-  # reuse depclean_scan output
-  orphans_file=$(depclean_scan)
-  if [ -z "$orphans_file" ] || [ ! -f "$orphans_file" ]; then
-    _log INFO "No orphans detected"
+  log_info "Packages needing rebuild: ${rebuilds[*]}"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] Would rebuild: ${rebuilds[*]}"
     return 0
   fi
-  _log INFO "Removing orphans (careful)"
-  run_clean_parallel "$orphans_file" "$PARALLEL"
-  _log INFO "Clean stage complete"
+  # run rebuilds in parallel with throttle
+  local cmds=()
+  for p in "${rebuilds[@]}"; do
+    [ -z "$p" ] && continue
+    cmds+=("fix_package '$p'")
+  done
+  run_parallel_jobs "${cmds[@]}"
+  compose_report
 }
 
-do_all() {
-  _log STAGE "Running full resolve: scan -> fix -> clean"
-  # 1) scan
-  broken_list_pkgs="$(revdep_scan)"
-  orphans_list_file="$(depclean_scan)"
-  # 2) fix broken packages
-  if [ -n "$broken_list_pkgs" ] && [ -f "$broken_list_pkgs" ]; then
-    _log INFO "Fixing broken packages..."
-    run_fixes_parallel "$broken_list_pkgs" "$PARALLEL"
-  else
-    _log INFO "No broken packages to fix"
-  fi
-  # 3) recompute orphans after fixes
-  orphans_list_file="$(depclean_scan)"
-  if [ -n "$orphans_list_file" ] && [ -f "$orphans_list_file" ]; then
-    _log INFO "Removing orphans detected after fixes..."
-    run_clean_parallel "$orphans_list_file" "$PARALLEL"
-  else
-    _log INFO "No orphans to remove"
-  fi
-  _log INFO "Full resolve completed"
+flow_all() {
+  log_stage "Running full pipeline: scan -> fix -> clean -> rebuild"
+  flow_scan
+  flow_fix
+  flow_clean
+  flow_rebuild_needed
+  log_info "Full pipeline finished"
 }
 
-# -------------------- Entrypoint --------------------
-_start="$(date +%s)"
-_log STAGE "porg-resolve started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-_log INFO "Flags: scan=$DO_SCAN fix=$DO_FIX clean=$DO_CLEAN dryrun=$DRY_RUN parallel=$PARALLEL json=$JSON target=$TARGET_PKG"
-
-if [ "$DO_SCAN" = true ]; then do_scan_only; fi
-if [ "$DO_FIX" = true ]; then do_fix_only; fi
-if [ "$DO_CLEAN" = true ]; then do_clean_only; fi
-if [ "$DO_SCAN" = false ] && [ "$DO_FIX" = false ] && [ "$DO_CLEAN" = false ]; then
-  _log INFO "No action requested"
+# --------------------- Dispatcher ---------------------
+if [ "$CMD_ALL" = true ]; then
+  CMD_SCAN=true; CMD_FIX=true; CMD_CLEAN=true; CMD_REBUILD=true
 fi
 
-_end="$(date +%s)"
-_duration=$(( _end - _start ))
-_log INFO "porg-resolve finished in ${_duration}s"
+# run requested flows
+if [ "$CMD_SCAN" = true ]; then flow_scan; fi
+if [ "$CMD_FIX" = true ]; then flow_fix; fi
+if [ "$CMD_CLEAN" = true ]; then flow_clean; fi
+if [ "$CMD_REBUILD" = true ]; then flow_rebuild_needed; fi
 
-# final report: aggregate REPORT_TMP into timestamped file
-ts="$(date -u +%Y%m%dT%H%M%SZ)"
-report_file="${REPORT_DIR}/resolve-report-${ts}.log"
-{
-  echo "porg-resolve run: $ts"
-  cat "$REPORT_TMP" 2>/dev/null || true
-  echo "duration_s: ${_duration}"
-} > "$report_file"
-_log INFO "Resolve report saved: $report_file"
-
-if [ "$JSON" = true ]; then
-  # try to create very simple JSON summary
-  python3 - <<PY > "${report_file}.json"
-import sys,json
-lines=open(sys.argv[1]).read().splitlines()
-summary = {"report_lines": lines}
-print(json.dumps(summary, indent=2, ensure_ascii=False))
-PY
-  "$report_file"
-  _log INFO "JSON report saved: ${report_file}.json"
+# If nothing requested, show usage
+if ! $CMD_SCAN && ! $CMD_FIX && ! $CMD_CLEAN && ! $CMD_REBUILD && ! $CMD_ALL ; then
+  usage
 fi
 
 exit 0
