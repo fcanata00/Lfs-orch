@@ -1,0 +1,217 @@
+# ======================================================================
+#  Porg Universal Metafile Example
+#  Demonstrates every supported feature
+# ======================================================================
+
+name: example-full-package
+version: 1.0
+release: 2
+category: examples
+summary: Example package demonstrating all Porg metafile capabilities
+description: |
+  This example metafile showcases every supported feature of Porg.
+  It includes multiple sources, patches, hooks, build flags, and auditing
+  options. Use this as a template when writing new package recipes.
+
+homepage: https://example.org/example-full-package
+license: MIT
+maintainer: example@example.org
+
+# ────────────────────────────────────────────────────────────────
+# 🌐 Sources — Multiple URLs, formats, mirrors, checksum types
+# ────────────────────────────────────────────────────────────────
+source:
+  - url: https://example.org/src/example-full-package-1.0.tar.xz
+    checksum: sha256=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+    gpg_sig: https://example.org/src/example-full-package-1.0.tar.xz.sig
+    mirror:
+      - https://mirror1.example.org/example-full-package-1.0.tar.xz
+      - https://backup.example.net/example-full-package-1.0.tar.xz
+  - url: https://example.org/src/docs/example-docs-1.0.tar.gz
+    checksum: sha512=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+
+# ────────────────────────────────────────────────────────────────
+# 🧩 Patches — Applied sequentially
+# ────────────────────────────────────────────────────────────────
+patches:
+  - name: fix-paths.patch
+    url: https://example.org/patches/fix-paths.patch
+  - name: security-fix.patch
+    url: https://example.org/patches/security-fix.patch
+  - name: portability.patch
+    url: https://example.org/patches/portability.patch
+    condition: "platform != 'x86_64'"
+
+# ────────────────────────────────────────────────────────────────
+# ⚙️ Dependencies — Build, runtime, optional, conflicts
+# ────────────────────────────────────────────────────────────────
+dependencies:
+  build:
+    - pkgconfig
+    - cmake
+    - gcc
+  runtime:
+    - glibc
+    - zlib
+  optional:
+    - openssl
+    - libpng
+  conflicts:
+    - example-old
+    - incompatible-lib
+
+# ────────────────────────────────────────────────────────────────
+# 🧠 Provides — Executables, libraries, headers, services
+# ────────────────────────────────────────────────────────────────
+provides:
+  binaries:
+    - example-full
+    - example-helper
+  libraries:
+    - libexample.so
+    - libexampleutils.so
+  headers:
+    - example.h
+    - example_utils.h
+  services:
+    - exampled
+
+# ────────────────────────────────────────────────────────────────
+# 🔨 Build — Complete control over environment and configuration
+# ────────────────────────────────────────────────────────────────
+build:
+  bootstrap: false
+  chroot: /mnt/lfs
+  fakeroot: true
+  parallel: true
+  build_dir: build
+  destdir: /mnt/lfs/build/example-full-package-1.0-dest
+  env:
+    CC: gcc
+    CXX: g++
+    CFLAGS: "-O2 -pipe -Wall"
+    LDFLAGS: "-Wl,-O1"
+    MAKEFLAGS: "-j$(nproc)"
+    LANG: en_US.UTF-8
+  configure_flags:
+    - --prefix=/usr
+    - --sysconfdir=/etc
+    - --localstatedir=/var
+    - --enable-optimizations
+    - --disable-debug
+    - --enable-shared
+    - --with-zlib
+    - --with-openssl
+  build_system: autotools   # autotools|cmake|meson|custom
+  custom_build_script: /usr/ports/examples/example-full-package/hooks/custom_build.sh
+  resource_limits:
+    cpu: 85      # Max CPU usage percentage
+    memory: 90   # Max memory percentage
+  timeout: 3600  # Seconds
+
+# ────────────────────────────────────────────────────────────────
+# 📦 Installation rules
+# ────────────────────────────────────────────────────────────────
+install:
+  strip: true
+  fakeroot: true
+  symlinks:
+    - /usr/bin/example -> /usr/bin/example-full
+  postinstall:
+    - ldconfig
+    - update-alternatives --install /usr/bin/example example /usr/bin/example-full 100
+  cleanup:
+    - /usr/share/doc/example-full-package/tmp/*
+    - /usr/lib/example/tests/
+
+# ────────────────────────────────────────────────────────────────
+# 🎣 Hooks — Executed automatically at each build stage
+# ────────────────────────────────────────────────────────────────
+hooks:
+  pre_download: /usr/ports/examples/example-full-package/hooks/pre_download.sh
+  post_download: /usr/ports/examples/example-full-package/hooks/post_download.sh
+  pre_patch: /usr/ports/examples/example-full-package/hooks/pre_patch.sh
+  post_patch: /usr/ports/examples/example-full-package/hooks/post_patch.sh
+  pre_build: /usr/ports/examples/example-full-package/hooks/pre_build.sh
+  post_build: /usr/ports/examples/example-full-package/hooks/post_build.sh
+  pre_install: /usr/ports/examples/example-full-package/hooks/pre_install.sh
+  post_install: /usr/ports/examples/example-full-package/hooks/post_install.sh
+  pre_remove: /usr/ports/examples/example-full-package/hooks/pre_remove.sh
+  post_remove: /usr/ports/examples/example-full-package/hooks/post_remove.sh
+  on_error: /usr/ports/examples/example-full-package/hooks/on_error.sh
+  on_success: /usr/ports/examples/example-full-package/hooks/on_success.sh
+
+# ────────────────────────────────────────────────────────────────
+# 🔍 Audit rules
+# ────────────────────────────────────────────────────────────────
+audit:
+  check_libs: true
+  check_links: true
+  check_deps: true
+  check_vulns: true
+  check_perms: true
+  check_orphans: true
+  check_symlinks: true
+  fix_automatically: true
+  cve_source: https://cve.circl.lu/api/last
+  sve_source: https://security-tracker.debian.org/tracker/source-package
+
+# ────────────────────────────────────────────────────────────────
+# 💾 Database and logs integration
+# ────────────────────────────────────────────────────────────────
+files:
+  manifest: /var/lib/porg/db/example-full-package-1.0.manifest
+  logfile: /var/log/porg/build/example-full-package-1.0.log
+  auditlog: /var/log/porg/audit/example-full-package-1.0.log
+  checksumfile: /var/lib/porg/db/example-full-package-1.0.checksums
+
+# ────────────────────────────────────────────────────────────────
+# 🚦 Triggers — Event-based system actions
+# ────────────────────────────────────────────────────────────────
+triggers:
+  on_upgrade:
+    - systemctl restart exampled
+  on_remove:
+    - echo "Package removed: example-full-package"
+  on_post_audit:
+    - porg-audit --report
+
+# ────────────────────────────────────────────────────────────────
+# 🌍 Git Integration
+# ────────────────────────────────────────────────────────────────
+repo:
+  url: https://github.com/example/porg-ports.git
+  branch: main
+  sync: true
+  sync_interval: daily
+  last_sync: 2025-10-06T23:55:00Z
+
+# ────────────────────────────────────────────────────────────────
+# 🧩 Upgrade and Resume Support
+# ────────────────────────────────────────────────────────────────
+upgrade:
+  resume: true
+  backup_old: true
+  backup_path: /var/backups/porg/example-full-package/
+  verify_checksums: true
+
+# ────────────────────────────────────────────────────────────────
+# 🧰 Miscellaneous Metadata
+# ────────────────────────────────────────────────────────────────
+metadata:
+  maintainer: "Fernando Canata <fernando@example.org>"
+  priority: optional
+  system_component: true
+  build_arch: x86_64
+  repo_path: /usr/ports/examples/example-full-package
+  created: 2025-10-06
+  updated: 2025-10-06
+  notes: |
+    This example metafile covers every field and is fully supported by:
+    - porg_builder.sh
+    - deps.py
+    - porg_logger.sh
+    - porg_db.sh
+    - porg_remove.sh
+    - porg_upgrade.sh
+    - porg_audit.sh
