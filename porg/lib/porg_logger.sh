@@ -1,380 +1,318 @@
 #!/usr/bin/env bash
-#
-# porg_logger.sh
-# Módulo de logging para Porg — colorido, spinner, barra de progresso, perf measurement, rotação de logs
-# Para usar:
-#   source /usr/lib/porg/porg_logger.sh
-#   log_init            # cria arquivo de sessão em /var/log/porg por padrão
-#   log INFO "Mensagem"
-#   log_perf make -j4
-#
+# porg_logger.sh - Logger avançado para Porg (cores, spinner, progresso, perf, JSON)
+# Path: /usr/lib/porg/porg_logger.sh
+# Load: source /usr/lib/porg/porg_logger.sh
 set -euo pipefail
 IFS=$'\n\t'
 
-# -------------------- Defaults (overwritten por /etc/porg/porg.conf se presente) --------------------
+# -------------------- Carregar configuração (respeitar /etc/porg/porg.conf) --------------------
 PORG_CONF="${PORG_CONF:-/etc/porg/porg.conf}"
-LOG_DIR="${LOG_DIR:-/var/log/porg}"
-LOG_LEVEL="${LOG_LEVEL:-INFO}"        # DEBUG|INFO|WARN|ERROR
-LOG_COLOR="${LOG_COLOR:-true}"        # true|false
-ROTATE="${ROTATE:-true}"              # rotação on/off
-ROTATE_LIMIT="${ROTATE_LIMIT:-10}"    # quantos arquivos manter
-KEEP_LOGS_DAYS="${KEEP_LOGS_DAYS:-30}"# dias para limpeza automática
-SESSION_LOG=""                        # caminho para o arquivo atual da sessão
-SESSION_START_TS=0
-ERROR_COUNT=0
-WARN_COUNT=0
-DEBUG_COUNT=0
-INFO_COUNT=0
-
-# -------------------- Carregar /etc/porg/porg.conf se existir --------------------
-_load_porg_conf() {
-  if [ -f "$PORG_CONF" ]; then
-    # file expected to contain KEY="value" lines; evaluate safely
-    while IFS= read -r line || [ -n "$line" ]; do
-      line="${line%%#*}"         # remove comments
-      line="${line%$'\r'}"
-      [ -z "$line" ] && continue
-      if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-        # shell-eval assignment
-        eval "$line"
-      fi
-    done < "$PORG_CONF"
-  fi
-}
-
-# -------------------- Colors (with fallback) --------------------
-_supports_color() {
-  # if LOG_COLOR explicitly false, return 1 (no color)
-  if [ "${LOG_COLOR}" = "false" ]; then return 1; fi
-  # check tty and tput
-  if command -v tput >/dev/null 2>&1 && [ -t 1 ]; then
-    ncolors=$(tput colors 2>/dev/null || echo 0)
-    [ "$ncolors" -ge 8 ] && return 0 || return 1
-  fi
-  return 1
-}
-
-if _supports_color; then
-  C_DEBUG="$(tput setaf 6)"  # ciano
-  C_INFO="$(tput setaf 2)"   # verde
-  C_WARN="$(tput setaf 3)"   # amarelo
-  C_ERROR="$(tput setaf 1)"  # vermelho
-  C_STAGE="$(tput setaf 4)"  # azul
-  C_RESET="$(tput sgr0)"
-else
-  C_DEBUG=""; C_INFO=""; C_WARN=""; C_ERROR=""; C_STAGE=""; C_RESET=""
+if [ -f "$PORG_CONF" ]; then
+  # shellcheck disable=SC1090
+  source "$PORG_CONF"
 fi
 
-# -------------------- Init / rotate --------------------
-_rotate_if_needed() {
-  # keep only ROTATE_LIMIT most recent logs
-  [ "${ROTATE}" = "true" ] || return 0
-  mkdir -p "$LOG_DIR"
-  # list session logs sorted by mtime (oldest first)
-  logs=( $(ls -1t "${LOG_DIR}" 2>/dev/null || true) )
-  if [ "${#logs[@]}" -le "$ROTATE_LIMIT" ]; then return 0; fi
-  # remove older beyond rotate limit
-  idx=0
-  for f in "${logs[@]}"; do
-    idx=$((idx+1))
-    if [ "$idx" -gt "$ROTATE_LIMIT" ]; then
-      rm -f "${LOG_DIR}/${f}" 2>/dev/null || true
-    fi
-  done
+# -------------------- Defaults (podem ser sobrescritos em porg.conf) --------------------
+LOG_DIR="${LOG_DIR:-/var/log/porg}"
+LOG_LEVEL="${LOG_LEVEL:-INFO}"       # ERROR|WARN|INFO|DEBUG
+LOG_COLOR="${LOG_COLOR:-true}"       # true/false
+QUIET_MODE_DEFAULT="${QUIET_MODE_DEFAULT:-false}"
+LOG_JSON="${LOG_JSON:-false}"        # true -> gera summary JSON por sessão
+LOG_JSON_DIR="${LOG_JSON_DIR:-${LOG_DIR}/json}"
+LOG_ROTATE_DAYS="${LOG_ROTATE_DAYS:-14}"
+SESSION_START_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+SESSION_LOG_FILE="${LOG_DIR}/porg-${SESSION_START_TS}.log"
+SESSION_JSON_FILE="${LOG_JSON_DIR}/porg-session-${SESSION_START_TS}.json"
+mkdir -p "$LOG_DIR" "$LOG_JSON_DIR"
+
+# -------------------- Terminal and color helpers --------------------
+_have_tty() { [ -t 1 ]; }
+if [ "${LOG_COLOR}" = true ] && _have_tty; then
+  # ANSI colors (fallback safe)
+  COLOR_RESET="$(tput sgr0 2>/dev/null || printf '\033[0m')"
+  COLOR_INFO="$(tput setaf 2 2>/dev/null || printf '\033[0;32m')"
+  COLOR_WARN="$(tput setaf 3 2>/dev/null || printf '\033[0;33m')"
+  COLOR_ERROR="$(tput setaf 1 2>/dev/null || printf '\033[0;31m')"
+  COLOR_DEBUG="$(tput setaf 6 2>/dev/null || printf '\033[0;36m')"
+  COLOR_STAGE="$(tput setaf 5 2>/dev/null || printf '\033[0;35m')"
+else
+  COLOR_RESET=""; COLOR_INFO=""; COLOR_WARN=""; COLOR_ERROR=""; COLOR_DEBUG=""; COLOR_STAGE=""
+fi
+
+# -------------------- Internal counters / session metadata --------------------
+SESSION_MESSAGES=()
+SESSION_COUNTS='{"INFO":0,"WARN":0,"ERROR":0,"DEBUG":0}'
+SESSION_START_EPOCH="$(date +%s)"
+CURRENT_QUIET="${QUIET_MODE_DEFAULT}"
+# allow modules to override QUIET by exporting QUIET=true before sourcing logger
+
+# -------------------- Low-level write (append to session log) --------------------
+_log_file_append() {
+  local line="$1"
+  # atomic append using >> (good enough for simple single-process logging). If concurrent writes expected,
+  # consider using flock in future.
+  printf "%s\n" "$line" >>"$SESSION_LOG_FILE"
 }
 
-# limpa logs mais antigos que N dias
-clean_old_logs() {
-  local days="${1:-$KEEP_LOGS_DAYS}"
-  if [ -z "$days" ] || ! [[ "$days" =~ ^[0-9]+$ ]]; then
-    echo "Uso: clean_old_logs <days>  (ex: clean_old_logs 30)"
-    return 2
-  fi
-  if [ -d "$LOG_DIR" ]; then
-    find "$LOG_DIR" -type f -mtime +"$days" -print0 | xargs -0r rm -f --
-    return 0
-  fi
-  return 0
-}
-
-# inicilizar logger: log_init [log_dir_or_file]
-# se argumento for diretório => cria sessão em <dir>/porg-YYYYmmdd-HHMMSS.log
-# se argumento for arquivo => usa exatamente esse arquivo
-log_init() {
-  _load_porg_conf
-  local target="${1:-${LOG_DIR}}"
-  if [ -d "$target" ]; then
-    mkdir -p "$target"
-    SESSION_LOG="${target%/}/porg-$(date -u +%Y%m%dT%H%M%SZ).log"
-  else
-    # if parent dir doesn't exist create it
-    mkdir -p "$(dirname "$target")"
-    SESSION_LOG="$target"
-  fi
-  mkdir -p "$(dirname "$SESSION_LOG")"
-  touch "$SESSION_LOG"
-  SESSION_START_TS=$(date +%s)
-  ERROR_COUNT=0; WARN_COUNT=0; DEBUG_COUNT=0; INFO_COUNT=0
-  # rotate old logs if requested
-  _rotate_if_needed
-  # header
-  echo "=== Porg log session started at $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$SESSION_LOG"
-  # also echo to stdout
-  log "INFO" "Log iniciado: $SESSION_LOG"
-}
-
-# -------------------- Basic logging function --------------------
-# log LEVEL MESSAGE
-# LEVEL: DEBUG|INFO|WARN|ERROR|OK|STAGE
-log() {
-  local level="${1:-INFO}"
-  shift || true
+# -------------------- Compose standardized timestamped line --------------------
+_log_line() {
+  local level="$1"; shift
   local msg="$*"
   local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  [ -n "$SESSION_LOG" ] || log_init
+  printf "%s [%s] %s" "$ts" "$level" "$msg"
+}
 
-  # Update counters
-  case "$level" in
-    DEBUG) DEBUG_COUNT=$((DEBUG_COUNT+1));;
-    INFO) INFO_COUNT=$((INFO_COUNT+1));;
-    WARN) WARN_COUNT=$((WARN_COUNT+1));;
-    ERROR) ERROR_COUNT=$((ERROR_COUNT+1));;
-  esac
-
-  # format line
-  local line="[$ts] [$level] $msg"
-  printf '%s\n' "$line" >> "$SESSION_LOG"
-
-  # decide to print to stdout based on LOG_LEVEL
-  # order: DEBUG < INFO < WARN < ERROR
-  declare -A lvlmap=( ["DEBUG"]=0 ["INFO"]=1 ["WARN"]=2 ["ERROR"]=3 )
-  local cur=${lvlmap[$LOG_LEVEL]:-1}
-  local want=${lvlmap[$level]:-1}
-  if [ "$want" -lt "$cur" ]; then
-    # lower-than-config level: skip printing to stdout
+# -------------------- Public logging functions --------------------
+_log_emit() {
+  local level="$1"; shift
+  local msg="$*"
+  # increment counters (shell JSON-ish update)
+  SESSION_COUNTS=$(python3 - <<PY
+import json,sys
+d=json.loads(sys.stdin.read())
+lvl=sys.argv[1]
+d[lvl]=d.get(lvl,0)+1
+print(json.dumps(d))
+PY
+"$SESSION_COUNTS" "$level" 2>/dev/null || echo "$SESSION_COUNTS")
+  local line; line="$(_log_line "$level" "$msg")"
+  # store message in session array (for JSON summary)
+  SESSION_MESSAGES+=("$line")
+  # write to logfile always
+  _log_file_append "$line"
+  # determine printing to stdout/stderr
+  if [ "${CURRENT_QUIET}" = true ] && [ "$level" != "ERROR" ] && [ "$level" != "WARN" ]; then
     return 0
   fi
-
-  # print colored
   case "$level" in
-    DEBUG)
-      printf "%b[DEBUG]%b %s\n" "$C_DEBUG" "$C_RESET" "$msg"
-      ;;
-    INFO)
-      printf "%b[INFO]%b  %s\n" "$C_INFO" "$C_RESET" "$msg"
-      ;;
-    WARN)
-      printf "%b[WARN]%b  %s\n" "$C_WARN" "$C_RESET" "$msg"
-      ;;
-    ERROR)
-      printf "%b[ERROR]%b %s\n" "$C_ERROR" "$C_RESET" "$msg"
-      ;;
-    OK)
-      printf "%b[ OK ]%b   %s\n" "$C_INFO" "$C_RESET" "$msg"
-      ;;
-    STAGE)
-      printf "%b[ >>> ]%b %s\n" "$C_STAGE" "$C_RESET" "$msg"
-      ;;
-    *)
-      printf "[%s] %s\n" "$level" "$msg"
-      ;;
+    INFO)  printf "%b%s%b\n" "${COLOR_INFO}" "$line" "${COLOR_RESET}" ;;
+    WARN)  printf "%b%s%b\n" "${COLOR_WARN}" "$line" "${COLOR_RESET}" >&2 ;;
+    ERROR) printf "%b%s%b\n" "${COLOR_ERROR}" "$line" "${COLOR_RESET}" >&2 ;;
+    DEBUG) if [ "${LOG_LEVEL}" = "DEBUG" ]; then printf "%b%s%b\n" "${COLOR_DEBUG}" "$line" "${COLOR_RESET}"; fi ;;
+    STAGE) printf "%b%s%b\n" "${COLOR_STAGE}" "$line" "${COLOR_RESET}" ;;
+    *) printf "%s\n" "$line" ;;
   esac
+  # optional: call db_log_event if provided by porg_db.sh
+  if declare -f db_log_event >/dev/null 2>&1; then
+    # best-effort, do not break on failure
+    db_log_event "$level" "$msg" || true
+  fi
 }
 
-# imprime seção
-log_section() {
-  local title="$*"
-  [ -n "$title" ] || return 1
-  [ -n "$SESSION_LOG" ] || log_init
-  local ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  printf '\n%s\n' "=== $title ===" | tee -a "$SESSION_LOG"
-  log "STAGE" "$title"
+log_info()  { _log_emit "INFO" "$*"; }
+log_warn()  { _log_emit "WARN" "$*"; }
+log_error() { _log_emit "ERROR" "$*"; }
+log_debug() { [ "${LOG_LEVEL}" = "DEBUG" ] && _log_emit "DEBUG" "$*"; }
+log_stage() { _log_emit "STAGE" "$*"; }
+
+# -------------------- Spinner (background) --------------------
+_SPINNER_PID=""
+_spinner_start() {
+  local msg="$1"
+  # prevent multiple spinners
+  if [ -n "$_SPINNER_PID" ] && kill -0 "$_SPINNER_PID" 2>/dev/null; then return 0; fi
+  # spinner characters
+  local chars=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' )
+  # start background spinner
+  (
+    trap 'exit 0' SIGTERM
+    local i=0
+    while :; do
+      # measure small metrics (loadavg)
+      local load; load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo "0.00")
+      printf "\r%s %s (loadavg:%s) " "${chars[i % ${#chars[@]}]}" "$msg" "$load"
+      i=$((i+1))
+      sleep 0.12
+    done
+  ) &
+  _SPINNER_PID=$!
+  disown "$_SPINNER_PID" 2>/dev/null || true
 }
 
-# -------------------- Helpers para performance (proc) --------------------
-# retorna: cpu_percent instantâneo (0-100)
-_cpu_percent_instant() {
-  # read /proc/stat and compute delta since last call
-  # static local prev values
-  local cur user nice system idle iowait irq softirq steal guest
-  read -r _cpu user nice system idle iowait irq softirq steal guest < /proc/stat
-  local idle_now=$((idle + iowait))
-  local total_now=$((user + nice + system + idle + iowait + irq + softirq + steal))
-  # use temp file to persist previous measurement
-  local tmpf="/tmp/.porg_cpu_prev"
-  if [ -f "$tmpf" ]; then
-    read -r prev_idle prev_total < "$tmpf"
+_spinner_stop() {
+  local rc="${1:-0}"
+  if [ -n "$_SPINNER_PID" ]; then
+    kill "$_SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$_SPINNER_PID" 2>/dev/null || true
+    unset _SPINNER_PID
+  fi
+  # finish line
+  if [ "$rc" -eq 0 ]; then
+    printf "\r✔\n"
   else
-    prev_idle=$idle_now; prev_total=$total_now
-    printf '%s %s' "$prev_idle" "$prev_total" > "$tmpf"
-    echo 0; return
+    printf "\r✖\n"
   fi
-  diff_idle=$((idle_now - prev_idle))
-  diff_total=$((total_now - prev_total))
-  printf '%s %s' "$idle_now" "$total_now" > "$tmpf"
-  if [ "$diff_total" -le 0 ]; then echo 0; return; fi
-  local usage=$((100 * (diff_total - diff_idle) / diff_total))
-  echo "$usage"
 }
 
-# retorna mem em MB usada (approx)
-_mem_used_mb() {
-  awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {printf "%d", (t-a)/1024}' /proc/meminfo 2>/dev/null || echo 0
-}
-
-_loadavg() {
-  awk '{printf "%.2f", $1}' /proc/loadavg 2>/dev/null || echo "0.00"
-}
-
-# -------------------- Spinner (monitor PID) --------------------
-# log_spinner <mensagem> <pid>
-# mostra spinner até pid morrer. grava resumo no log ao finalizar.
-log_spinner() {
-  local msg="$1"; local pid="$2"
-  [ -n "$SESSION_LOG" ] || log_init
-  if ! kill -0 "$pid" 2>/dev/null; then
-    log "WARN" "PID $pid não está em execução para spinner"
-    return 1
-  fi
-  local spin='|/-\\'
-  local i=0
-  local start_ts=$(date +%s)
-  # header
-  printf "%s " "$msg"
-  while kill -0 "$pid" 2>/dev/null; do
-    i=$(( (i + 1) % 4 ))
-    printf "\b%c" "${spin:$i:1}"
-    # show small perf snapshot
-    local cpu=$(_cpu_percent_instant)
-    local mem=$(_mem_used_mb)
-    local load=$(_loadavg)
-    printf " cpu:%s%% mem:%sMB load:%s\r" "$cpu" "$mem" "$load"
-    sleep 0.6
-  done
-  wait "$pid" 2>/dev/null || true
-  local rc=$?
-  local end_ts=$(date +%s); local dura=$((end_ts - start_ts))
-  printf "\n"
-  log "INFO" "$msg finished (rc=$rc, duration=${dura}s)"
-  return "$rc"
-}
-
-# -------------------- Progress bar (Portage-like) --------------------
-# log_progress <percent> <mensagem> <eta_seconds_or_string>
-# percent: 0..100
+# -------------------- Progress bar helper --------------------
+# usage: log_progress current total "Message"
 log_progress() {
-  local percent="${1:-0}"
-  local msg="${2:-}"
-  local eta="${3:-}"
-  local load=$( _loadavg )
-  local cpu=$( _cpu_percent_instant )
-  local mem=$( _mem_used_mb )
-  local width=28
-  # ensure percent numeric
-  if ! [[ "$percent" =~ ^[0-9]+$ ]]; then percent=0; fi
-  if [ "$percent" -lt 0 ]; then percent=0; fi
-  if [ "$percent" -gt 100 ]; then percent=100; fi
-  local filled=$((percent * width / 100)); local empty=$((width - filled))
-  local bar="$(printf '%0.s█' $(seq 1 $filled) 2>/dev/null)$(printf '%0.s░' $(seq 1 $empty) 2>/dev/null)"
-  # format ETA
-  local eta_s=""
-  if [[ "$eta" =~ ^[0-9]+$ ]]; then eta_s="$(eta_fmt "$eta")"; else eta_s="$eta"; fi
-  printf "\r%s  [%s] %3d%% ETA:%s load:%s cpu:%s%% mem:%sMB  %s" "$msg" "$bar" "$percent" "$eta_s" "$load" "$cpu" "$mem" " "
-  # also log snapshot line into session log (once every call)
-  printf '%s [%s] %3d%% ETA:%s load:%s cpu:%s%% mem:%sMB %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" "$percent" "$eta_s" "$load" "$cpu" "$mem" "" >> "$SESSION_LOG"
+  local cur="$1"; local total="$2"; local msg="$3"
+  if [ "$total" -le 0 ]; then
+    printf "\r%s [%d/?] %s" "$(date +%H:%M:%S)" "$cur" "$msg"
+    return 0
+  fi
+  local width=36
+  local pct=$(( cur * 100 / total ))
+  local fill=$(( pct * width / 100 ))
+  local empty=$(( width - fill ))
+  local bar
+  bar="$(printf '#%.0s' $(seq 1 $fill))$(printf ' %.0s' $(seq 1 $empty))"
+  printf "\r%s [%s] %3d%% %s" "$msg" "$bar" "$pct" "$cur/$total"
+  if [ "$cur" -ge "$total" ]; then printf "\n"; fi
 }
 
-# helper to format seconds to hh:mm:ss
-eta_fmt() {
-  local s="$1"
-  printf "%02d:%02d:%02d" $((s/3600)) $(((s%3600)/60)) $((s%60))
-}
-
-# -------------------- log_perf: executar comando e medir perf --------------------
-# log_perf <cmd...>
-# Retorna o exit code do comando
+# -------------------- Performance wrapper: run command and sample peak RSS --------------------
+# usage: log_perf "label" -- command args...
+# collects: elapsed_s, exit_code, peak_rss_kb, start_load, end_load
 log_perf() {
-  [ "$#" -gt 0 ] || return 2
-  [ -n "$SESSION_LOG" ] || log_init
+  local label="$1"
+  shift
+  if [ $# -lt 1 ]; then log_error "log_perf requires -- command"; return 2; fi
+  # expect "--" delimiter optional
+  if [ "$1" = "--" ]; then shift; fi
   local cmd=( "$@" )
-  local start_ts=$(date +%s)
-  local start_uptime=$(cat /proc/uptime 2>/dev/null | awk '{print int($1)}' || echo 0)
-  # capture /proc/stat baseline for CPU delta
-  local stat_prev="$(cat /proc/stat | head -n1)"
-  # run command in background with its own pid
+  log_stage "PERF START: $label -> ${cmd[*]}"
+  local start_epoch_ns; start_epoch_ns=$(date +%s%N)
+  local start_load; start_load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo "0.00")
+  local pid
+  local peak_rss=0
+  # run command in background, sample RSS
   "${cmd[@]}" &
-  local pid=$!
-  log "INFO" "Executando: ${cmd[*]}  (pid=$pid)"
-  # monitor: sample mem and cpu for this pid while running
-  local peak_mem=0
-  local samples=0
-  local cpu_acc=0
+  pid=$!
+  # sample loop
   while kill -0 "$pid" 2>/dev/null; do
-    # per-process mem (RSS in KB) and cpu% approximation (not exact)
-    if [ -r "/proc/${pid}/status" ]; then
-      rss_kb=$(awk '/VmRSS:/ {print $2}' /proc/${pid}/status 2>/dev/null || echo 0)
-      [ -z "$rss_kb" ] && rss_kb=0
-      rss_mb=$((rss_kb/1024))
-      [ "$rss_mb" -gt "$peak_mem" ] && peak_mem="$rss_mb"
+    # try reading /proc/<pid>/status VmRSS
+    if [ -r "/proc/$pid/status" ]; then
+      local rss_kb; rss_kb=$(awk '/VmRSS:/ {print $2}' /proc/"$pid"/status 2>/dev/null || echo 0)
+      rss_kb=${rss_kb:-0}
+      if [ "$rss_kb" -gt "$peak_rss" ] 2>/dev/null; then peak_rss=$rss_kb; fi
     fi
-    # approximate cpu% via system instant cpu (cheap)
-    cpu_now=$(_cpu_percent_instant)
-    cpu_acc=$((cpu_acc + cpu_now))
-    samples=$((samples + 1))
-    sleep 1
+    sleep 0.12
   done
-  wait "$pid"
-  local rc=$?
-  local end_ts=$(date +%s)
-  local duration=$((end_ts - start_ts))
-  local avg_cpu=0
-  if [ "$samples" -gt 0 ]; then avg_cpu=$((cpu_acc / samples)); fi
-  local load=$( _loadavg )
-  printf "Comando finalizado: rc=%d, duracao=%ds, avg_cpu=%s%%, peak_mem=%sMB, load=%s\n" "$rc" "$duration" "$avg_cpu" "$peak_mem" "$load" >> "$SESSION_LOG"
-  log "INFO" "Comando finalizado: rc=$rc, duracao=${duration}s, avg_cpu=${avg_cpu}%, peak_mem=${peak_mem}MB, load=${load}"
-  return "$rc"
+  wait "$pid" || true
+  local exit_code=$?
+  local end_epoch_ns; end_epoch_ns=$(date +%s%N)
+  local elapsed_ns=$((end_epoch_ns - start_epoch_ns))
+  local elapsed_s; elapsed_s=$(awk "BEGIN {printf \"%.3f\", $elapsed_ns/1000000000}")
+  local end_load; end_load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo "0.00")
+  log_info "PERF: $label exit=$exit_code elapsed=${elapsed_s}s peak_rss=${peak_rss}KB load_before=${start_load} load_after=${end_load}"
+  # append to session messages as structured line for later JSON export
+  SESSION_MESSAGES+=("PERF|$label|exit=$exit_code|elapsed_s=${elapsed_s}|peak_rss_kb=${peak_rss}|load_before=${start_load}|load_after=${end_load}")
+  return "$exit_code"
 }
 
-# -------------------- log_summary (final) --------------------
+# -------------------- Session summary -> text and JSON --------------------
 log_summary() {
-  [ -n "$SESSION_LOG" ] || log_init
-  local end_ts=$(date +%s)
-  local total=$((end_ts - SESSION_START_TS))
-  log "INFO" "Resumo da sessão: duração=${total}s, errors=${ERROR_COUNT}, warnings=${WARN_COUNT}, info=${INFO_COUNT}, debug=${DEBUG_COUNT}"
-  printf '{"time":"%s","duration_s":%d,"errors":%d,"warnings":%d,"info":%d,"debug":%d}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$total" "$ERROR_COUNT" "$WARN_COUNT" "$INFO_COUNT" "$DEBUG_COUNT" >> "$SESSION_LOG"
+  local end_epoch; end_epoch=$(date +%s)
+  local elapsed=$(( end_epoch - SESSION_START_EPOCH ))
+  local info_count; info_count=$(python3 - <<PY
+import json,sys
+d=json.loads('''$SESSION_COUNTS''')
+print(d.get('INFO',0))
+PY
+)
+  local warn_count; warn_count=$(python3 - <<PY
+import json,sys
+d=json.loads('''$SESSION_COUNTS''')
+print(d.get('WARN',0))
+PY
+)
+  local err_count; err_count=$(python3 - <<PY
+import json,sys
+d=json.loads('''$SESSION_COUNTS''')
+print(d.get('ERROR',0))
+PY
+)
+  local dbg_count; dbg_count=$(python3 - <<PY
+import json,sys
+d=json.loads('''$SESSION_COUNTS''')
+print(d.get('DEBUG',0))
+PY
+)
+  log_info "SESSION SUMMARY: duration=${elapsed}s INFO=${info_count} WARN=${warn_count} ERROR=${err_count} DEBUG=${dbg_count}"
+  # JSON output if requested
+  if [ "${LOG_JSON}" = true ]; then
+    mkdir -p "$(dirname "$SESSION_JSON_FILE")"
+    # build JSON using python for safety
+    python3 - <<PY > "$SESSION_JSON_FILE"
+import json,sys,time
+summary={}
+summary["session_start"]="${SESSION_START_TS}"
+summary["session_end"]="$(date -u +%Y%m%dT%H%M%SZ)"
+summary["duration_s"]=${elapsed}
+summary["counts"]=${SESSION_COUNTS}
+summary["messages"]=${MSG_JSON}
+# flatten messages
+mes=[]
+for m in ${SESSION_MESSAGES[@]+"${SESSION_MESSAGES[@]}"}:
+    pass
+# we'll reconstruct differently: read log file lines
+try:
+    with open("${SESSION_LOG_FILE}","r",encoding='utf-8') as f:
+        lines=f.read().splitlines()
+except:
+    lines=[]
+summary["log_lines"]=lines
+print(json.dumps(summary,indent=2,ensure_ascii=False))
+PY
+    log_info "Session JSON exported to $SESSION_JSON_FILE"
+  fi
 }
 
-# -------------------- Export functions for sourcing scripts --------------------
-# When sourced, these names are available to caller script
-# Provide a small CLI for direct invocation (clean logs)
+# -------------------- Log rotation / cleanup --------------------
+rotate_logs() {
+  find "$LOG_DIR" -maxdepth 1 -type f -name "porg-*.log" -mtime +"$LOG_ROTATE_DAYS" -print -exec gzip -9 {} \; || true
+  log_info "rotate_logs: compressed logs older than ${LOG_ROTATE_DAYS} days in $LOG_DIR"
+}
+
+clean_old_logs() {
+  local days="${1:-$LOG_ROTATE_DAYS}"
+  find "$LOG_DIR" -type f -name "porg-*.log*.gz" -mtime +"$days" -print -delete || true
+  log_info "clean_old_logs: removed archived logs older than ${days} days"
+}
+
+# -------------------- CLI for logger utility --------------------
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  # invoked directly as script
-  case "$1" in
+  # executed as script
+  cmd="${1:-help}"
+  case "$cmd" in
     --clean-old)
-      d="${2:-$KEEP_LOGS_DAYS}"
-      clean_old_logs "$d"
+      clean_old_logs "${2:-$LOG_ROTATE_DAYS}"
+      exit 0
       ;;
     --rotate)
-      _rotate_if_needed
+      rotate_logs
+      exit 0
       ;;
-    --init)
-      log_init "${2:-}"
+    --summary)
+      log_summary
+      exit 0
       ;;
-    --help|*)
+    --help|help)
       cat <<EOF
-porg_logger.sh - helper
-Usage:
-  source /usr/lib/porg/porg_logger.sh    # to use functions in shell
-  ./porg_logger.sh --init [dir|file]     # create new session log
-  ./porg_logger.sh --clean-old <days>    # delete logs older than <days>
-  ./porg_logger.sh --rotate              # perform rotation check
+porg_logger.sh - helper/CLI
+Usage: $0 [--clean-old [days]] [--rotate] [--summary] [--help]
+  --clean-old [days]  Remove archived logs older than 'days'
+  --rotate            Compress older logs (older than LOG_ROTATE_DAYS)
+  --summary           Print session summary (and export JSON if LOG_JSON=true)
 EOF
+      exit 0
+      ;;
+    *)
+      echo "Unknown logger CLI command: $cmd" >&2
+      exit 2
       ;;
   esac
-  exit 0
 fi
 
-# exported names (bash sourcing doesn't require "export", just define)
-# functions available: log_init, log, log_section, log_spinner, log_progress, log_perf, log_summary, clean_old_logs
+# -------------------- Expose small API for other modules --------------------
+# Functions available for modules that source this file:
+# log_info, log_warn, log_error, log_debug, log_stage, _spinner_start, _spinner_stop,
+# log_progress, log_perf, log_summary, rotate_logs, clean_old_logs
+export -f log_info log_warn log_error log_debug log_stage _spinner_start _spinner_stop log_progress log_perf log_summary rotate_logs clean_old_logs
 
-# end of porg_logger.sh
+# init: write first header line
+printf "%s\n" "=== Porg log session started at $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$SESSION_LOG_FILE"
+_log_emit "INFO" "Logger initialized (logfile=$SESSION_LOG_FILE)"
+# end of file
