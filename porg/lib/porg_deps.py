@@ -1,507 +1,660 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-/usr/lib/porg/deps.py
-
-Resolvedor de dependências do Porg (integra com porg_builder.sh e porg_logger.sh)
-
-Funcionalidades:
-- localizar metafile YAML de um pacote em /usr/ports/<categoria>/<pkg>/
-- parsear metafile (usa PyYAML se disponível; fallback para parser simples)
-- resolver dependências recursivamente (build_depends + depends)
-- detectar ciclos e avisar
-- cachear resultados em /var/cache/porg/deps_cache.json
-- checar dependências instaladas via DB simples em /var/db/porg/installed.json
-- integracao com logger shell: invoca porg_logger.sh via bash -c 'source ...; log INFO "...' para produzir logs coloridos
-- modos CLI: resolve, check, missing, graph, register-installed, unregister-installed, cache-clear
-
-Usage:
-  python3 /usr/lib/porg/deps.py resolve gcc
-  python3 /usr/lib/porg/deps.py missing gcc
-  python3 /usr/lib/porg/deps.py check gcc
-  python3 /usr/lib/porg/deps.py graph gcc
-  python3 /usr/lib/porg/deps.py register-installed gcc-13.2.0
-  python3 /usr/lib/porg/deps.py cache-clear
-
-O builder deve chamar este resolvedor antes de iniciar o build,
-por exemplo: python3 /usr/lib/porg/deps.py resolve gcc
+porg_deps.py - Resolvedor avançado de dependências para Porg
+- suporta group metafiles (blfs/xorg/kde)
+- ordena por tiers (core, system, libs, gui, desktop)
+- gera upgrade plan, detecta rebuilds necessários
+- integra com /etc/porg/porg.conf e INSTALLED_DB
+- CLI: resolve, upgrade-plan, graph, missing, check, register-installed
 """
 
 from __future__ import annotations
-import sys
-import os
-import json
-import subprocess
-import argparse
-import fnmatch
-import time
-from typing import Dict, List, Set, Tuple, Optional
+import os, sys, json, time, argparse, subprocess, collections, traceback
+from typing import Dict, List, Set, Tuple, Any
 
-# -------------------- Paths & defaults --------------------
+# ---------------------------
+# Config (carrega /etc/porg/porg.conf se existir)
+# ---------------------------
 PORG_CONF = os.environ.get("PORG_CONF", "/etc/porg/porg.conf")
-DEFAULT_PORTS_DIR = "/usr/ports"
-CACHE_DIR = os.environ.get("PORG_CACHE_DIR", "/var/cache/porg")
-DEPS_CACHE = os.path.join(CACHE_DIR, "deps_cache.json")
-DB_DIR = os.environ.get("PORG_DB_DIR", "/var/db/porg")
-INSTALLED_DB = os.path.join(DB_DIR, "installed.json")
-LOGGER_SCRIPT = os.environ.get("PORG_LOGGER", "/usr/lib/porg/porg_logger.sh")
-LOG_DIR = os.environ.get("LOG_DIR", "/var/log/porg")  # fallback; porg.conf may override
-
-# ensure dirs exist (may require privileges)
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(DB_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-
-# -------------------- Helper: call shell logger --------------------
-def shell_log(level: str, message: str) -> None:
-    """
-    Call the shell logger by sourcing the porg_logger.sh and invoking log.
-    This keeps log colorization and file session behavior centralized.
-    """
+CONFIG = {}
+if os.path.isfile(PORG_CONF):
     try:
-        # Use bash -lc to source and call log; escape message safely
-        safe = message.replace("'", "'\"'\"'")
-        cmd = f"source '{LOGGER_SCRIPT}' >/dev/null 2>&1 || true; log {level} '{safe}'"
-        subprocess.run(["bash", "-lc", cmd], check=False)
-    except Exception:
-        # best-effort; do not fail deps resolution because logging failed
-        pass
-
-# -------------------- Read porg.conf (simple KEY=VALUE parser) --------------------
-def load_porg_conf(conf_path: str = PORG_CONF) -> Dict[str, str]:
-    cfg = {}
-    if not os.path.isfile(conf_path):
-        return cfg
-    try:
-        with open(conf_path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.split("#", 1)[0].strip()
-                if not line:
+        # porg.conf is a shell script with KEY=VALUE, parse simply
+        with open(PORG_CONF, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
                     continue
                 if "=" in line:
                     k, v = line.split("=", 1)
                     k = k.strip()
                     v = v.strip().strip('"').strip("'")
-                    cfg[k] = v
+                    CONFIG[k] = v
     except Exception:
         pass
-    return cfg
 
-# Merge porg.conf overrides
-_pconf = load_porg_conf()
-PORTS_DIR = _pconf.get("PORTS_DIR", DEFAULT_PORTS_DIR)
-LOG_DIR = _pconf.get("LOG_DIR", LOG_DIR)
-CACHE_DIR = _pconf.get("CACHE_DIR", CACHE_DIR)
+PORTS_DIR = os.environ.get("PORTS_DIR", CONFIG.get("PORTS_DIR", "/usr/ports"))
+INSTALLED_DB = os.environ.get("INSTALLED_DB", CONFIG.get("INSTALLED_DB", os.path.join(CONFIG.get("DB_DIR", "/var/lib/porg/db"), "installed.json")))
+CACHE_DIR = os.environ.get("CACHE_DIR", CONFIG.get("CACHE_DIR", "/var/cache/porg"))
 DEPS_CACHE = os.path.join(CACHE_DIR, "deps_cache.json")
-INSTALLED_DB = os.path.join(DB_DIR, "installed.json")
+LOGGER_SCRIPT = os.environ.get("LOGGER_SCRIPT", CONFIG.get("LOGGER_MODULE", "/usr/lib/porg/porg_logger.sh"))
 
-# -------------------- YAML parsing --------------------
-# Prefer PyYAML if available, else fallback to simple parser for our schema
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# ---------------------------
+# Tiers priority mapping
+# ---------------------------
+TIER_ORDER = {
+    "core": 0,
+    "system": 1,
+    "libs": 2,
+    "gui": 3,
+    "desktop": 4,
+    "optional": 5,
+    "unknown": 6
+}
+
+# ---------------------------
+# YAML loader: prefer PyYAML if available, fallback to simple parser
+# ---------------------------
 try:
-    import yaml  # type: ignore
-    _HAS_YAML = True
+    import yaml
+    YAML_AVAILABLE = True
 except Exception:
-    _HAS_YAML = False
+    YAML_AVAILABLE = False
 
-def parse_metafile_yaml(path: str) -> Dict:
-    """
-    Parse the package metafile YAML and return a dict.
-    Supports expected keys:
-      name, version, depends (list), build_depends (list), sources, patches, hooks, stage, etc.
-    """
+def load_yaml_file(path: str) -> Dict[str, Any]:
     if not os.path.isfile(path):
         return {}
-    if _HAS_YAML:
+    if YAML_AVAILABLE:
         try:
             with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-                # normalize lists
-                if isinstance(data.get("depends"), str):
-                    data["depends"] = [data["depends"]]
-                if isinstance(data.get("build_depends"), str):
-                    data["build_depends"] = [data["build_depends"]]
-                return data
+                return yaml.safe_load(f) or {}
         except Exception:
+            # fallback to basic
             pass
-    # fallback simple parser: look for lines 'depends:' then following '- item'
+    # basic fallback parser (extracts simple key: value and lists)
     data = {}
-    cur = None
-    arr = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.rstrip("\n")
-                stripped = line.lstrip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                if ":" in stripped and not stripped.startswith("-"):
-                    k, v = stripped.split(":", 1)
-                    k = k.strip()
-                    v = v.strip()
-                    if v == "" or v in ("|", ">"):
-                        cur = k
-                        arr = []
-                        data[k] = arr
-                    else:
-                        # scalar
-                        data[k] = v.strip().strip('"').strip("'")
-                        cur = None
-                elif stripped.startswith("-") and cur:
-                    item = stripped[1:].strip()
-                    arr.append(item)
-    except Exception:
-        pass
+    current_list_key = None
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if ":" in s and not s.startswith("-"):
+                k, v = s.split(":", 1)
+                k = k.strip()
+                v = v.strip()
+                if v == "":
+                    data[k] = {}
+                    current_list_key = k
+                else:
+                    # strip quotes
+                    if v.startswith(("'", '"')) and v.endswith(("'", '"')):
+                        v = v[1:-1]
+                    data[k] = v
+                    current_list_key = None
+            elif s.startswith("-") and current_list_key:
+                item = s[1:].strip()
+                if isinstance(data.get(current_list_key), list):
+                    data[current_list_key].append(item)
+                else:
+                    data[current_list_key] = [item]
+            else:
+                # no-op
+                current_list_key = None
     return data
 
-# -------------------- Locate metafile --------------------
-def find_metafile_for(pkg_name: str) -> Optional[str]:
+# ---------------------------
+# Logging helper: if porg_logger.sh exists call it, else print
+# ---------------------------
+def shell_log(level: str, msg: str):
     """
-    Search PORTS_DIR for a metafile that corresponds to pkg_name.
-    Expected location: /usr/ports/<cat>/<pkg>/<pkg>-<version>.yaml
-    We'll search for files matching {pkg_name}*.y*ml under PORTS_DIR/*
-    Returns the first match or None.
+    Attempts to call porg_logger.sh functions if available, else prints.
+    level in: INFO, WARN, ERROR, DEBUG, STAGE
     """
-    # look for directories named pkg_name first
-    candidates = []
-    # Walk two levels: PORTS_DIR/category/pkg/*
-    if not os.path.isdir(PORTS_DIR):
-        return None
-    for cat in os.listdir(PORTS_DIR):
-        cdir = os.path.join(PORTS_DIR, cat)
-        if not os.path.isdir(cdir):
-            continue
-        pkgdir = os.path.join(cdir, pkg_name)
-        if os.path.isdir(pkgdir):
-            # find yaml files inside pkgdir
-            for entry in os.listdir(pkgdir):
-                if fnmatch.fnmatch(entry.lower(), f"{pkg_name}*.y*ml"):
-                    candidates.append(os.path.join(pkgdir, entry))
-            if candidates:
-                return candidates[0]
-    # fallback: global walk (could be slower)
-    for root, dirs, files in os.walk(PORTS_DIR):
-        for name in files:
-            if fnmatch.fnmatch(name.lower(), f"{pkg_name}*.y*ml") or name.lower().startswith(f"{pkg_name}-"):
-                candidates.append(os.path.join(root, name))
-    if candidates:
-        return candidates[0]
-    return None
-
-# -------------------- Installed DB helpers --------------------
-def load_installed_db() -> Dict[str, Dict]:
-    if os.path.isfile(INSTALLED_DB):
+    if os.path.isfile(LOGGER_SCRIPT):
+        # call logger in a subshell to avoid altering env
         try:
+            subprocess.run(["bash", "-lc",
+                            f"source '{LOGGER_SCRIPT}' >/dev/null 2>&1 || true; "
+                            f"if declare -f log_{level.lower()} >/dev/null 2>&1; then log_{level.lower()} '{msg.replace(\"'\",\"'\\\\''\")}' ; else echo '[{level}] {msg}'; fi"],
+                           check=False)
+            return
+        except Exception:
+            pass
+    # fallback
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if level == "ERROR":
+        print(f"{ts} [{level}] {msg}", file=sys.stderr)
+    else:
+        print(f"{ts} [{level}] {msg}")
+
+# ---------------------------
+# Installed DB helpers
+# ---------------------------
+def read_installed_db() -> Dict[str, Dict[str, Any]]:
+    try:
+        if os.path.isfile(INSTALLED_DB):
             with open(INSTALLED_DB, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            return {}
+    except Exception:
+        shell_log("WARN", f"Failed to read installed DB {INSTALLED_DB}, treating as empty")
     return {}
 
-def save_installed_db(dct: Dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(INSTALLED_DB), exist_ok=True)
-        with open(INSTALLED_DB, "w", encoding="utf-8") as f:
-            json.dump(dct, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
-
-def is_installed(pkg_query: str) -> bool:
-    """
-    pkg_query may be 'pkg' or 'pkg-version'
-    We'll consider installed if any installed entry starts with pkg_query or equals it.
-    """
-    db = load_installed_db()
-    for key in db.keys():
-        if key == pkg_query or key.startswith(pkg_query + "-") or key.startswith(pkg_query + "/"):
-            return True
-        # also support pkg without version
-        if key.split("-")[0] == pkg_query:
+def is_installed(pkgname: str, installed_db: Dict[str, Any]) -> bool:
+    for k, v in installed_db.items():
+        if k == pkgname or k.startswith(pkgname + "-") or v.get("name") == pkgname:
             return True
     return False
 
-# -------------------- Cache helpers --------------------
-def load_cache() -> Dict[str, List[str]]:
-    try:
-        if os.path.isfile(DEPS_CACHE):
-            with open(DEPS_CACHE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
+def installed_version(pkgname: str, installed_db: Dict[str, Any]) -> str:
+    for k, v in installed_db.items():
+        if k == pkgname or k.startswith(pkgname + "-") or v.get("name") == pkgname:
+            return v.get("version", "")
+    return ""
 
-def save_cache(cache: Dict[str, List[str]]) -> None:
-    try:
-        os.makedirs(os.path.dirname(DEPS_CACHE), exist_ok=True)
-        with open(DEPS_CACHE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+# ---------------------------
+# Metafile discovery
+# ---------------------------
+def find_metafile(pkg: str) -> str:
+    """
+    Procura por <pkg>*.yml/yaml dentro de PORTS_DIR e suas subpastas.
+    Retorna o primeiro caminho encontrado ou ''.
+    """
+    if not os.path.isdir(PORTS_DIR):
+        return ""
+    for root, _, files in os.walk(PORTS_DIR):
+        for fn in files:
+            ln = fn.lower()
+            if not (ln.endswith(".yml") or ln.endswith(".yaml")):
+                continue
+            name_noext = ln.rsplit(".", 1)[0]
+            # try to match prefix
+            if name_noext.startswith(pkg.lower()):
+                return os.path.join(root, fn)
+    return ""
 
-# -------------------- Core: resolve dependencies --------------------
-class DependencyResolver:
+# ---------------------------
+# Parse a package metafile returning canonical dict
+# ---------------------------
+def parse_metafile(path: str) -> Dict[str, Any]:
+    data = load_yaml_file(path)
+    result = {}
+    result["path"] = path
+    result["name"] = data.get("name") or data.get("pkg") or os.path.splitext(os.path.basename(path))[0]
+    result["version"] = str(data.get("version") or data.get("ver") or data.get("release") or "")
+    # dependencies could be present as dependencies.build/runtime/optional or dependencies: [..]
+    deps = []
+    dd = data.get("dependencies") or data.get("depends") or {}
+    if isinstance(dd, dict):
+        for key in ("build", "runtime", "optional"):
+            val = dd.get(key)
+            if isinstance(val, list):
+                deps.extend(val)
+            elif isinstance(val, str):
+                deps.append(val)
+    elif isinstance(dd, list):
+        deps.extend(dd)
+    # also support top-level 'depends' or 'deps' lists
+    for alt in ("deps", "requires"):
+        av = data.get(alt)
+        if isinstance(av, list):
+            deps.extend(av)
+    # normalize unique
+    result["dependencies"] = list(dict.fromkeys([d for d in deps if d]))
+    # group components
+    if data.get("group") or data.get("components") or data.get("components"):
+        result["is_group"] = True
+        comps = data.get("components") or []
+        if isinstance(comps, str):
+            comps = [comps]
+        result["components"] = comps
+    else:
+        result["is_group"] = False
+        result["components"] = []
+    # tier
+    tier = data.get("tier") or data.get("priority") or "unknown"
+    tier = tier if tier in TIER_ORDER else tier.lower() if tier.lower() in TIER_ORDER else "unknown"
+    result["tier"] = tier
+    # optional metadata
+    result["metadata"] = data.get("metadata", {}) if isinstance(data.get("metadata", {}), dict) else {}
+    return result
+
+# ---------------------------
+# Cache metafile parsing to avoid repeated IO
+# ---------------------------
+_PARSED_METAFILES: Dict[str, Dict[str, Any]] = {}
+def get_pkg_meta(pkg: str) -> Dict[str, Any]:
+    # search for metafile
+    mf = find_metafile(pkg)
+    if not mf:
+        return {"name": pkg, "version": "", "dependencies": [], "is_group": False, "components": [], "tier": "unknown", "path": ""}
+    if mf in _PARSED_METAFILES:
+        return _PARSED_METAFILES[mf]
+    try:
+        p = parse_metafile(mf)
+        _PARSED_METAFILES[mf] = p
+        return p
+    except Exception:
+        shell_log("WARN", f"Failed to parse metafile {mf}")
+        return {"name": pkg, "version": "", "dependencies": [], "is_group": False, "components": [], "tier": "unknown", "path": mf}
+
+# ---------------------------
+# Expand group metafiles to components
+# ---------------------------
+def expand_group(pkg: str) -> List[str]:
+    """
+    If pkg refers to a group metafile (eg: 'xorg' or path to a group), expand to its components.
+    Returns components list or [pkg] if not a group.
+    """
+    meta = get_pkg_meta(pkg)
+    if meta.get("is_group"):
+        comps = meta.get("components", []) or []
+        # components might be names or package names; return as-is
+        return comps
+    # also check if there is a group metafile named pkg-group or pkg.yaml with group:true
+    return [pkg]
+
+# ---------------------------
+# Build dependency graph (recursive)
+# ---------------------------
+class DepResolver:
     def __init__(self):
-        self.cache = load_cache()  # maps pkg_name -> resolved list
+        self.installed_db = read_installed_db()
+        self.graph: Dict[str, Set[str]] = {}   # node -> set(deps)
+        self.meta: Dict[str, Dict[str, Any]] = {}  # node -> metadata
         self.visiting: Set[str] = set()
-        self.resolved: Dict[str, List[str]] = {}  # memo
+        self.visited: Set[str] = set()
         self.cycles: List[List[str]] = []
+        self.needs_rebuild_cache: Dict[str, bool] = {}
 
-    def _read_metafile_deps(self, pkg: str) -> Tuple[List[str], List[str]]:
+    def add_node(self, pkg: str):
+        if pkg in self.graph:
+            return
+        self.graph[pkg] = set()
+        pm = get_pkg_meta(pkg)
+        self.meta[pkg] = pm
+
+    def add_edge(self, pkg: str, dep: str):
+        self.add_node(pkg)
+        self.add_node(dep)
+        self.graph[pkg].add(dep)
+
+    def build_graph_for(self, roots: List[str], expand_groups=True):
         """
-        Return (build_depends, depends) for pkg.
-        If metafile not found, return empty lists.
+        roots: list of package names or group names
+        expand_groups: if True, expand group metafiles automatically
         """
-        mf = find_metafile_for(pkg)
-        if not mf:
-            shell_log("WARN", f"Metafile not found for package '{pkg}' (searched in {PORTS_DIR})")
-            return ([], [])
-        data = parse_metafile_yaml(mf)
-        # keys may be 'build_depends', 'build-depends', 'depends', 'run_depends'
-        build = []
-        run = []
-        for k, v in data.items():
-            kl = k.lower()
-            if kl in ("build_depends", "build-depends", "build-requires", "build_requires", "build_requires:"):
-                if isinstance(v, list):
-                    build = [str(x).strip() for x in v if x]
-                elif isinstance(v, str):
-                    build = [v.strip()]
-            if kl in ("depends", "run_depends", "runtime_depends", "requires", "run-depends"):
-                if isinstance(v, list):
-                    run = [str(x).strip() for x in v if x]
-                elif isinstance(v, str):
-                    run = [v.strip()]
-        # also accept 'depends' and 'build_depends' top-level common names
-        # Some metafiles use 'dependencies' etc; we'll attempt a few more keys:
-        if not build:
-            for alt in ("build_requires", "build-requires"):
-                if alt in data:
-                    vv = data.get(alt, [])
-                    build = vv if isinstance(vv, list) else [vv]
-        if not run:
-            for alt in ("runtime_requires", "runtime-depends", "requires"):
-                if alt in data:
-                    vv = data.get(alt, [])
-                    run = vv if isinstance(vv, list) else [vv]
-        # normalize: strip version qualifiers like pkg>=1.2 -> pkg
-        build = [self._normalize_name(x) for x in build]
-        run = [self._normalize_name(x) for x in run]
-        return (build, run)
+        to_process = list(roots)
+        while to_process:
+            cur = to_process.pop(0)
+            # if group expand
+            comps = expand_group(cur) if expand_groups else [cur]
+            for comp in comps:
+                if comp not in self.graph:
+                    self.add_node(comp)
+                # parse meta
+                pm = get_pkg_meta(comp)
+                deps = pm.get("dependencies", []) or []
+                # add dependencies edges
+                for d in deps:
+                    self.add_edge(comp, d)
+                    if d not in self.graph:
+                        to_process.append(d)
+                # if metafile is a group and has components, ensure components become processed
+                if pm.get("is_group"):
+                    for c in pm.get("components", []):
+                        if c not in self.graph:
+                            to_process.append(c)
 
-    def _normalize_name(self, s: str) -> str:
-        # Remove parentheses, version specs, alternatives 'pkg (>= 1.2)', 'pkg>=1.2', 'pkg | other'
-        if not s:
-            return s
-        # handle 'pkg@version' or 'pkg-version' keep base
-        s = s.strip()
-        # if contains space then take first token
-        # remove things after whitespace or characters like >=, =, ( etc.
-        for sep in [" ", ">=", "<=", "==", "=", "(", "[", "{", ";", ","]:
-            if sep in s:
-                s = s.split(sep, 1)[0]
-        # if pipes alternatives, take first
-        if "|" in s:
-            s = s.split("|", 1)[0]
-        return s.strip()
-
-    def resolve(self, pkg: str) -> List[str]:
-        """
-        Return ordered list of packages to build (dependency order)
-        If pkg is already cached, return cached.
-        """
-        if pkg in self.cache:
-            shell_log("DEBUG", f"deps cache hit for {pkg}")
-            return self.cache[pkg]
-
-        self.visiting = set()
-        order: List[str] = []
-        visited: Set[str] = set()
-
-        def dfs(node: str, stack: List[str]):
-            if node in visited:
-                return
-            if node in stack:
-                # found cycle
-                cyc = stack[stack.index(node):] + [node]
+    def _dfs_cycle(self, node: str, stack: List[str]):
+        if node in self.visiting:
+            # cycle found
+            try:
+                idx = stack.index(node)
+                cyc = stack[idx:] + [node]
                 self.cycles.append(cyc)
-                shell_log("ERROR", f"Dependency cycle detected: {' -> '.join(cyc)}")
-                return
-            stack.append(node)
-            # read deps for node
-            build_deps, run_deps = self._read_metafile_deps(node)
-            # combine build_deps first, then run_deps (build deps are required to build this package)
-            for dep in (build_deps + run_deps):
-                if not dep:
-                    continue
-                # skip if already installed
-                if is_installed(dep):
-                    shell_log("DEBUG", f"Dependency {dep} already installed; skipping")
-                    continue
-                dfs(dep, stack)
-            # after children
-            stack.pop()
-            if node not in visited:
-                visited.add(node)
-                order.append(node)
+            except ValueError:
+                self.cycles.append(stack + [node])
+            return
+        if node in self.visited:
+            return
+        self.visiting.add(node)
+        stack.append(node)
+        for dep in self.graph.get(node, []):
+            self._dfs_cycle(dep, stack)
+        stack.pop()
+        self.visiting.remove(node)
+        self.visited.add(node)
 
-        dfs(pkg, [])
-        # order is bottom-up; ensure pkg is at end; return order
-        # Save to cache
-        self.cache[pkg] = order
-        save_cache(self.cache)
+    def detect_cycles(self) -> List[List[str]]:
+        self.visiting.clear(); self.visited.clear(); self.cycles.clear()
+        for n in list(self.graph.keys()):
+            if n not in self.visited:
+                self._dfs_cycle(n, [])
+        return self.cycles
+
+    def topo_sort(self) -> List[str]:
+        """
+        Topological sort returning list where dependencies come BEFORE dependents.
+        If cycles exist, return a best-effort order and log cycles.
+        """
+        indeg = {n: 0 for n in self.graph}
+        for n, deps in self.graph.items():
+            for d in deps:
+                indeg[d] = indeg.get(d, 0) + 1
+        q = collections.deque([n for n,deg in indeg.items() if deg == 0])
+        order = []
+        while q:
+            n = q.popleft()
+            order.append(n)
+            for m in list(self.graph.get(n, [])):
+                indeg[m] -= 1
+                if indeg[m] == 0:
+                    q.append(m)
+        if len(order) != len(self.graph):
+            # cycle detected - fallback: append remaining nodes
+            remaining = [n for n in self.graph if n not in order]
+            order.extend(remaining)
         return order
 
-    def missing(self, pkg: str) -> List[str]:
+    def tier_sort(self, nodes: List[str]) -> List[str]:
         """
-        Return list of dependencies (resolved) that are not installed.
+        Stable sort of nodes by tier priority. Keep topo order within same tier.
         """
-        resolved = self.resolve(pkg)
-        missing = [p for p in resolved if not is_installed(p)]
-        return missing
+        def tier_val(n):
+            t = (self.meta.get(n) or {}).get("tier", "unknown") or "unknown"
+            return TIER_ORDER.get(t, TIER_ORDER["unknown"])
+        # stable sort preserving original order for equal keys
+        return sorted(nodes, key=lambda x: (tier_val(x), nodes.index(x)))
 
-    def check(self, pkg: str) -> bool:
+    def compute_upgrade_plan(self, target_roots: List[str]) -> Dict[str, Any]:
         """
-        Return True if all deps are installed.
+        Builds graph from target_roots, detects cycles, topologically sorts, applies tier ordering,
+        and marks which packages require rebuild compared to installed DB.
+        Returns dict:
+        {
+           "order": [pkg...],
+           "tiers": {pkg: tier},
+           "needs_rebuild": [pkg...],
+           "cycles": [...],
+           "meta": {...}
+        }
         """
-        m = self.missing(pkg)
-        return len(m) == 0
+        # build graph expanding groups
+        self.build_graph_for(target_roots, expand_groups=True)
+        cycles = self.detect_cycles()
+        if cycles:
+            for c in cycles:
+                shell_log("WARN", f"Dependency cycle detected: {' -> '.join(c)}")
+        topo = self.topo_sort()  # deps-before-dependents
+        # we want build order: from low-level to high-level (deps first)
+        # topo is already deps first; we can then order by tier to ensure core before gui etc.
+        ordered = self.tier_sort(topo)
 
-    def graph(self, pkg: str) -> str:
-        """
-        Return a simple textual graph representation (one edge per line: A -> B)
-        """
-        visited = set()
-        edges = []
+        # detect rebuilds: version mismatch or dependency has rebuild
+        needs_rebuild = set()
+        # helper recursive detection
+        def check_rebuild(pkg: str, visited_local: Set[str]) -> bool:
+            if pkg in self.needs_rebuild_cache:
+                return self.needs_rebuild_cache[pkg]
+            if pkg in visited_local:
+                # cycle -> force rebuild
+                self.needs_rebuild_cache[pkg] = True
+                return True
+            visited_local.add(pkg)
+            meta = self.meta.get(pkg) or get_pkg_meta(pkg)
+            installed_ver = installed_version(pkg, self.installed_db)
+            src_ver = meta.get("version", "") or ""
+            # if not installed => needs build
+            if not installed_ver:
+                self.needs_rebuild_cache[pkg] = True
+                visited_local.remove(pkg)
+                return True
+            # different version => rebuild
+            if src_ver and src_ver != installed_ver:
+                self.needs_rebuild_cache[pkg] = True
+                visited_local.remove(pkg)
+                return True
+            # if any dependency needs rebuild => this needs rebuild
+            for d in self.graph.get(pkg, []):
+                if check_rebuild(d, visited_local):
+                    self.needs_rebuild_cache[pkg] = True
+                    visited_local.remove(pkg)
+                    return True
+            self.needs_rebuild_cache[pkg] = False
+            visited_local.remove(pkg)
+            return False
 
-        def dfs_edges(node: str):
-            if node in visited:
-                return
-            visited.add(node)
-            build_deps, run_deps = self._read_metafile_deps(node)
-            for dep in (build_deps + run_deps):
-                if not dep:
-                    continue
-                edges.append(f"{node} -> {dep}")
-                dfs_edges(dep)
+        for n in ordered:
+            check_rebuild(n, set())
 
-        dfs_edges(pkg)
-        return "\n".join(edges)
+        needs = [p for p, val in self.needs_rebuild_cache.items() if val]
 
-# -------------------- CLI --------------------
-def parse_args(argv):
-    p = argparse.ArgumentParser(prog="porg-deps", description="Porg dependency resolver")
+        # populate tiers map and meta subset
+        tiers = {n: (self.meta.get(n) or {}).get("tier", "unknown") for n in ordered}
+        meta_small = {n: {k: self.meta.get(n, {}).get(k) for k in ("version", "tier", "path")} for n in ordered}
+
+        return {
+            "order": ordered,
+            "tiers": tiers,
+            "needs_rebuild": needs,
+            "cycles": cycles,
+            "meta": meta_small
+        }
+
+# ---------------------------
+# CLI commands implementations
+# ---------------------------
+def cmd_resolve(args):
+    """
+    Resolve dependencies for a package (or group). Print JSON: {"order":[...], "needs_rebuild":[...]}
+    """
+    dr = DepResolver()
+    dr.installed_db = read_installed_db()
+    plan = dr.compute_upgrade_plan([args.pkg])
+    out = {
+        "pkg": args.pkg,
+        "order": plan["order"],
+        "needs_rebuild": plan["needs_rebuild"],
+        "tiers": plan["tiers"],
+        "cycles": plan["cycles"]
+    }
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+def cmd_upgrade_plan(args):
+    """
+    Generate upgrade plan for argument(s) or for full world if --world given.
+    """
+    dr = DepResolver()
+    dr.installed_db = read_installed_db()
+    roots = []
+    if args.world:
+        # build roots from installed DB keys (package names)
+        db = dr.installed_db
+        for k,v in db.items():
+            name = v.get("name") or k
+            roots.append(name)
+    elif args.group:
+        roots.extend(expand_group(args.group))
+    elif args.pkgs:
+        roots.extend(args.pkgs)
+    else:
+        print("Specify --pkgs <pkg1 pkg2...> or --group <group> or --world", file=sys.stderr)
+        sys.exit(2)
+    # compute plan for each root; to avoid duplicate edges, give roots as set
+    plan = dr.compute_upgrade_plan(roots)
+    # order is dependencies-first; for upgrade we probably want to build in the same order
+    result = {
+        "roots": roots,
+        "upgrade_order": plan["order"],
+        "needs_rebuild": plan["needs_rebuild"],
+        "cycles": plan["cycles"],
+        "meta": plan["meta"]
+    }
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+def cmd_graph(args):
+    dr = DepResolver()
+    dr.installed_db = read_installed_db()
+    dr.build_graph_for(args.pkgs or [args.pkg], expand_groups=True)
+    # output nested graph JSON
+    def node_to_obj(n, seen):
+        if n in seen:
+            return {"pkg": n, "tier": dr.meta.get(n, {}).get("tier", "unknown"), "note": "cycle"}
+        seen.add(n)
+        deps = sorted(list(dr.graph.get(n, [])))
+        return {"pkg": n, "tier": dr.meta.get(n, {}).get("tier", "unknown"), "depends": [node_to_obj(d, seen.copy()) for d in deps]}
+    roots = args.pkgs or [args.pkg]
+    out = [node_to_obj(r, set()) for r in roots]
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+def cmd_missing(args):
+    """
+    Show missing dependencies for a package (compared to installed DB).
+    """
+    dr = DepResolver()
+    dr.installed_db = read_installed_db()
+    dr.build_graph_for([args.pkg], expand_groups=True)
+    missing = []
+    for n in dr.graph:
+        if not is_installed(n, dr.installed_db):
+            missing.append(n)
+    print(json.dumps({"pkg": args.pkg, "missing": missing}, indent=2, ensure_ascii=False))
+
+def cmd_check(args):
+    """
+    Check if a package is installed and up-to-date vs metafile version.
+    """
+    db = read_installed_db()
+    installed = is_installed(args.pkg, db)
+    meta = get_pkg_meta(args.pkg)
+    src_ver = meta.get("version", "")
+    inst_ver = installed_version(args.pkg, db)
+    needs = False
+    reason = ""
+    if not installed:
+        needs = True
+        reason = "not installed"
+    elif src_ver and inst_ver and src_ver != inst_ver:
+        needs = True
+        reason = f"installed {inst_ver} != source {src_ver}"
+    print(json.dumps({"pkg": args.pkg, "installed": installed, "installed_version": inst_ver, "source_version": src_ver, "needs_rebuild": needs, "reason": reason}, indent=2, ensure_ascii=False))
+
+def cmd_register_installed(args):
+    """
+    Register packages in DB by scanning a prefix or using given key. Useful after manual install.
+    """
+    db = read_installed_db()
+    out = []
+    if args.key:
+        # try to register a single key (format: name version prefix)
+        parts = args.key.split(":")
+        if len(parts) < 2:
+            print("Usage for key: name:version[:prefix]", file=sys.stderr)
+            sys.exit(2)
+        name = parts[0]; ver = parts[1]; prefix = parts[2] if len(parts) > 2 else "/"
+        # call porg_db.sh register if available else write directly
+        dbp = INSTALLED_DB
+        try:
+            # atomic append via python
+            with open(dbp, "r+", encoding="utf-8") as f:
+                data = json.load(f)
+                key = name + "-" + ver
+                data[key] = {"name": name, "version": ver, "prefix": prefix, "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                f.seek(0); f.truncate(0); json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=True)
+            out.append({"registered": key})
+        except Exception as e:
+            print("Failed to register:", e, file=sys.stderr)
+            sys.exit(3)
+    elif args.prefix:
+        # scan prefix for binaries? simplified: look for manifest files under prefix/var/lib/porg/manifests or similar
+        print(json.dumps({"scanned_prefix": args.prefix, "note": "manual registration not fully implemented"}, indent=2, ensure_ascii=False))
+        return
+    else:
+        print("Provide --key name:version[:prefix] or --prefix /mnt/dir", file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+# ---------------------------
+# CLI parser
+# ---------------------------
+def build_parser():
+    p = argparse.ArgumentParser(prog="porg_deps.py", description="Resolvedor avançado de dependências (Porg)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("cache-clear", help="Clear deps cache")
-    sub_res = sub.add_parser("resolve", help="Resolve dependency list for a package")
-    sub_res.add_argument("pkg")
-    sub_miss = sub.add_parser("missing", help="List missing dependencies (not installed)")
-    sub_miss.add_argument("pkg")
-    sub_check = sub.add_parser("check", help="Check if all dependencies are installed")
-    sub_check.add_argument("pkg")
-    sub_graph = sub.add_parser("graph", help="Print dependency graph")
-    sub_graph.add_argument("pkg")
-    sub_reg = sub.add_parser("register-installed", help="Register package as installed")
-    sub_reg.add_argument("pkgid")  # e.g., gcc-13.2.0
-    sub_unreg = sub.add_parser("unregister-installed", help="Remove package from installed DB")
-    sub_unreg.add_argument("pkgid")
-    sub_list = sub.add_parser("list-installed", help="List installed packages")
-    return p.parse_args(argv)
 
-def main(argv):
-    args = parse_args(argv)
-    dr = DependencyResolver()
+    s_resolve = sub.add_parser("resolve", help="Resolve dependencies for a package and print ordered list")
+    s_resolve.add_argument("pkg", help="Pacote ou grupo a resolver")
 
-    if args.cmd == "cache-clear":
-        try:
-            if os.path.isfile(DEPS_CACHE):
-                os.remove(DEPS_CACHE)
-            shell_log("INFO", "Deps cache cleared")
-            print("OK")
-        except Exception as e:
-            shell_log("ERROR", f"Failed to clear deps cache: {e}")
-            print("ERROR", file=sys.stderr)
-            sys.exit(1)
-        sys.exit(0)
+    s_upgrade = sub.add_parser("upgrade-plan", help="Generate upgrade plan")
+    s_upgrade.add_argument("--pkgs", nargs="*", help="Pacotes alvo (mutiple)", dest="pkgs")
+    s_upgrade.add_argument("--group", help="Grupo a expandir (ex: blfs/xorg/kde)")
+    s_upgrade.add_argument("--world", action="store_true", help="Plan for entire installed world")
 
-    if args.cmd == "resolve":
-        pkg = args.pkg
-        shell_log("INFO", f"Resolving dependencies for {pkg}")
-        try:
-            order = dr.resolve(pkg)
-            # output JSON list
-            out = {"package": pkg, "order": order, "cycles": dr.cycles}
-            print(json.dumps(out, ensure_ascii=False))
-            shell_log("INFO", f"Resolved {len(order)} items for {pkg}")
-            sys.exit(0)
-        except Exception as e:
-            shell_log("ERROR", f"Error resolving {pkg}: {e}")
-            print(json.dumps({"error": str(e)}))
-            sys.exit(1)
+    s_graph = sub.add_parser("graph", help="Output dependency tree (JSON)")
+    s_graph.add_argument("--pkg", help="root package", dest="pkg")
+    s_graph.add_argument("--pkgs", nargs="*", help="multiple roots", dest="pkgs")
 
-    if args.cmd == "missing":
-        pkg = args.pkg
-        shell_log("INFO", f"Checking missing dependencies for {pkg}")
-        try:
-            missing = dr.missing(pkg)
-            print(json.dumps({"package": pkg, "missing": missing}, ensure_ascii=False))
-            if missing:
-                shell_log("WARN", f"Missing deps for {pkg}: {', '.join(missing)}")
-            else:
-                shell_log("INFO", f"All deps satisfied for {pkg}")
-            sys.exit(0)
-        except Exception as e:
-            shell_log("ERROR", f"Error checking missing deps for {pkg}: {e}")
-            print(json.dumps({"error": str(e)}))
-            sys.exit(1)
+    s_missing = sub.add_parser("missing", help="List missing packages in installed DB for a given package")
+    s_missing.add_argument("pkg", help="package")
 
-    if args.cmd == "check":
-        pkg = args.pkg
-        ok = dr.check(pkg)
-        print(json.dumps({"package": pkg, "ok": ok}))
-        if ok:
-            shell_log("INFO", f"Dependencies satisfied for {pkg}")
+    s_check = sub.add_parser("check", help="Check installed vs source version for a package")
+    s_check.add_argument("pkg", help="package")
+
+    s_register = sub.add_parser("register-installed", help="Register a package in installed DB")
+    s_register.add_argument("--key", help="Register as name:version[:prefix]")
+    s_register.add_argument("--prefix", help="Scan prefix (not fully implemented)")
+
+    s_info = sub.add_parser("info", help="Show resolver info (cache, ports dir)")
+    s_info.add_argument("--json", action="store_true")
+
+    return p
+
+def cmd_info(args):
+    info = {
+        "ports_dir": PORTS_DIR,
+        "installed_db": INSTALLED_DB,
+        "cache": DEPS_CACHE,
+        "yaml_available": YAML_AVAILABLE
+    }
+    if args.json:
+        print(json.dumps(info, indent=2, ensure_ascii=False))
+    else:
+        for k,v in info.items():
+            print(f"{k}: {v}")
+
+# ---------------------------
+# Entrypoint
+# ---------------------------
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        if args.cmd == "resolve":
+            cmd_resolve(args)
+        elif args.cmd == "upgrade-plan":
+            cmd_upgrade_plan(args)
+        elif args.cmd == "graph":
+            if not args.pkg and not args.pkgs:
+                print("Provide --pkg or --pkgs", file=sys.stderr); sys.exit(2)
+            cmd_graph(args)
+        elif args.cmd == "missing":
+            cmd_missing(args)
+        elif args.cmd == "check":
+            cmd_check(args)
+        elif args.cmd == "register-installed":
+            cmd_register_installed(args)
+        elif args.cmd == "info":
+            cmd_info(args)
         else:
-            shell_log("WARN", f"Dependencies NOT satisfied for {pkg}")
-        sys.exit(0)
-
-    if args.cmd == "graph":
-        pkg = args.pkg
-        shell_log("INFO", f"Generating dependency graph for {pkg}")
-        g = dr.graph(pkg)
-        print(g)
-        # also log a brief summary
-        shell_log("DEBUG", f"Graph for {pkg} generated with {len(g.splitlines())} edges")
-        sys.exit(0)
-
-    if args.cmd == "register-installed":
-        pkgid = args.pkgid
-        db = load_installed_db()
-        db[pkgid] = {"installed_at": time.time()}
-        save_installed_db(db)
-        shell_log("INFO", f"Registered installed package: {pkgid}")
-        print("OK")
-        sys.exit(0)
-
-    if args.cmd == "unregister-installed":
-        pkgid = args.pkgid
-        db = load_installed_db()
-        if pkgid in db:
-            db.pop(pkgid, None)
-            save_installed_db(db)
-            shell_log("INFO", f"Unregistered installed package: {pkgid}")
-            print("OK")
-        else:
-            shell_log("WARN", f"Package not found in installed DB: {pkgid}")
-            print("NOTFOUND")
-        sys.exit(0)
-
-    if args.cmd == "list-installed":
-        db = load_installed_db()
-        print(json.dumps({"installed": list(db.keys())}, ensure_ascii=False))
-        shell_log("DEBUG", f"Listed {len(db)} installed packages")
-        sys.exit(0)
-
-    # fallback
-    print("Unknown command", file=sys.stderr)
-    sys.exit(2)
+            parser.print_help()
+    except Exception as e:
+        shell_log("ERROR", f"Exception in porg_deps.py: {e}\n{traceback.format_exc()}")
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()
