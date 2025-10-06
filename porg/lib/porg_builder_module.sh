@@ -1,28 +1,20 @@
 #!/usr/bin/env bash
-# porg_builder_mono.sh
-# Monolithic Porg builder module
-# - Self-contained pipeline: download, verify, extract, patch, hooks, build (bwrap), install (fakeroot), strip, package (.tar.zst), optional expand to /
-# - Reads global config (default /etc/porg/porg.conf) and the package metafile YAML passed as argument
-# - Minimal YAML parser included (no yq dependency)
-# - Quiet mode with Portage-like progress bar + ETA + load/mem
 #
-# Usage:
-#   ./porg_builder_mono.sh [options] /path/to/metafile.yml
-# Options:
-#   -q|--quiet       quiet progress (bar)
-#   -i|--install     build and expand package into / (dangerous; requires confirmation)
-#   -c|--clean       clean workdir/cache before running
-#   -y|--yes         auto-yes for expand-root
-#   -h|--help        show help
+# porg_builder.sh
+# Módulo monolítico do Porg — pipeline completo de build LFS-style
+# - Leitura de /etc/porg/porg.conf
+# - Leitura do metafile YAML em /usr/ports/...
+# - download -> verify -> extract -> patch -> hooks -> build (bwrap) -> install (fakeroot) -> strip -> package (.tar.zst) -> optional expand to /
+# - Quiet mode com barra estilo Portage (porcentagem, ETA, load, CPU, MEM)
+# - Usa somente módulos externos configurados em porg.conf: LOG_MODULE, DEPS_CMD, DB_CMD
 #
 set -euo pipefail
 IFS=$'\n\t'
 
-### ----------------------------- Defaults & Global config -----------------------------
+### -------------------- Config global e defaults --------------------
 DEFAULT_CONFIG="/etc/porg/porg.conf"
-CONFIG="${PORG_CONFIG:-$DEFAULT_CONFIG}"
-
-# Defaults which can be overridden by the config file
+PORG_CONFIG="${PORG_CONFIG:-$DEFAULT_CONFIG}"
+# Valores padrão (podem ser sobrescritos no porg.conf)
 PORTS_DIR="/usr/ports"
 WORKDIR="/var/tmp/porg/work"
 CACHE_DIR=""
@@ -35,28 +27,24 @@ PACKAGE_FORMAT="tar.zst"
 CHROOT_METHOD="bwrap"
 STRICT_GPG="false"
 STRIP_BINARIES="true"
-LOG_MODULE=""       # optional external logger script path or command
-DEPS_CMD=""         # optional dependency resolver command (porg_deps.py)
-DB_CMD=""           # optional registry/db manager command
+LOG_MODULE=""   # caminho para script externo de logging (opcional)
+DEPS_CMD=""     # caminho para resolvedor de dependências (opcional)
+DB_CMD=""       # caminho para registrar pacote (opcional)
 QUIET=false
 AUTO_YES=false
 
-# helper for reading key=value porg.conf style (simple)
 load_global_config() {
-  if [ -f "$CONFIG" ]; then
-    # shell-friendly config: KEY="value" lines or key=value
-    # source safely: restrict to allowed variable names
-    while IFS= read -r line; do
-      line="${line%%#*}"         # strip comments
-      line="${line%%$'\r'}"
+  if [ -f "$PORG_CONFIG" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      # strip comments and CR
+      line="${line%%#*}"
+      line="${line%$'\r'}"
       [ -z "$line" ] && continue
       if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-        # Evaluate assignment in a safe way
         eval "$line"
       fi
-    done < "$CONFIG"
+    done < "$PORG_CONFIG"
   fi
-  # set derived defaults if empty
   : "${CACHE_DIR:=${WORKDIR}/cache}"
   : "${LOG_DIR:=${WORKDIR}/logs}"
   : "${PATCH_DIR:=${WORKDIR}/patches}"
@@ -64,45 +52,45 @@ load_global_config() {
   mkdir -p "$WORKDIR" "$CACHE_DIR" "$LOG_DIR" "$PATCH_DIR" "$DESTDIR_BASE"
 }
 
-### ----------------------------- CLI parse -----------------------------
+### -------------------- CLI --------------------
 usage() {
   cat <<EOF
-Usage: ${0##*/} [options] <metafile.yml>
+Usage: ${0##*/} [options] <command> <metafile.yml>
+Commands:
+  build <metafile.yml>      Run full pipeline for the given metafile
+  package <destdir>         Create package (.tar.zst) from destdir
+  expand-root <pkgfile>     Expand package into / (dangerous)
+  help                      Show this help
 Options:
-  -q|--quiet        quiet progress (bar)
-  -i|--install      build and expand into / after packaging (dangerous)
-  -c|--clean        clean workdir/cache before building
-  -y|--yes          auto-confirm destructive operations
-  -h|--help         show this help
+  -q|--quiet     Quiet progress (Portage-like bar)
+  -i|--install   Build and expand into / after packaging (dangerous)
+  -c|--clean     Clean workdir/cache before building
+  -y|--yes       Auto-confirm destructive operations (expand-root)
+  -h|--help      Show help
 EOF
 }
 
 if [ "$#" -lt 1 ]; then usage; exit 1; fi
 
-# process options
-POSITIONAL=()
-CLEAN_BEFORE=false
-DO_EXPAND=false
-while [[ $# -gt 0 ]]; do
+CMD="$1"; shift || true
+# options that can precede command or after
+OPTS_PRE=()
+while [[ "$#" -gt 0 && "$1" =~ ^- ]]; do
   case "$1" in
     -q|--quiet) QUIET=true; shift ;;
-    -i|--install) DO_EXPAND=true; shift ;;
+    -i|--install) EXPORT_INSTALL=true; shift ;; # handled per-command
     -c|--clean) CLEAN_BEFORE=true; shift ;;
     -y|--yes) AUTO_YES=true; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
-    -* ) echo "Unknown option: $1"; usage; exit 2 ;;
-    *) POSITIONAL+=("$1"); shift ;;
+    *) echo "Unknown option: $1"; usage; exit 2 ;;
   esac
 done
-set -- "${POSITIONAL[@]}"
-METAFILE="${1:-}"
-[ -f "$METAFILE" ] || { echo "Metafile not found: $METAFILE" >&2; exit 2; }
 
-# load porg.conf now (so env overrides if provided earlier still apply)
+# load config
 load_global_config
 
-### ----------------------------- Logging -----------------------------
+### -------------------- Logging helpers --------------------
 COLOR_RESET="\e[0m"
 COLOR_INFO="\e[32m"
 COLOR_WARN="\e[33m"
@@ -114,21 +102,21 @@ log_internal() {
   local msg="$*"
   local ts
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  # If external logger module is configured and executable, call it (non-blocking)
+  # external logger (non-fatal)
   if [ -n "$LOG_MODULE" ] && command -v "$LOG_MODULE" >/dev/null 2>&1; then
-    # call external logger with args: level timestamp message
     "$LOG_MODULE" "$level" "$ts" "$msg" >/dev/null 2>&1 || true
   fi
-  # write to file always
   printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE"
-  # colored console output unless quiet
-  if [ "$QUIET" != "true" ]; then
+  if [ "$QUIET" != true ]; then
     case "$level" in
       INFO)  printf "%b[INFO]%b  %s\n" "$COLOR_INFO" "$COLOR_RESET" "$msg" ;;
-      WARN)  printf "%b[WARN]%b  %s\n"  "$COLOR_WARN" "$COLOR_RESET" "$msg" ;;
-      ERROR) printf "%b[ERROR]%b %s\n"  "$COLOR_ERROR" "$COLOR_RESET" "$msg" ;;
+      WARN)  printf "%b[WARN]%b  %s\n" "$COLOR_WARN" "$COLOR_RESET" "$msg" ;;
+      ERROR) printf "%b[ERROR]%b %s\n" "$COLOR_ERROR" "$COLOR_RESET" "$msg" ;;
       *)     printf "[%s] %s\n" "$level" "$msg" ;;
     esac
+  else
+    # in quiet mode, only log to file; progress bar handled elsewhere
+    :
   fi
 }
 
@@ -137,10 +125,7 @@ _die() {
   cleanup_and_exit 1
 }
 
-log_internal INFO "Starting porg_builder_mono.sh for metafile: $METAFILE"
-log_internal INFO "Using porg config: $CONFIG"
-
-### ----------------------------- Tool checks -----------------------------
+### -------------------- Tool checks --------------------
 require_tool() {
   for t in "$@"; do
     if ! command -v "$t" >/dev/null 2>&1; then
@@ -148,302 +133,243 @@ require_tool() {
     fi
   done
 }
-# basic required tools - some used conditionally but check major ones
+# check common tools (some used conditionally later)
 require_tool bash curl tar zstd fakeroot file find awk sed grep xargs
 
-# prefer bwrap; if CHROOT_METHOD == bwrap, verify
-if [ "$CHROOT_METHOD" = "bwrap" ]; then
-  if ! command -v bwrap >/dev/null 2>&1; then
-    log_internal WARN "bubblewrap requested but not found; falling back to chroot where possible"
-    CHROOT_METHOD="chroot"
-  fi
+# If requested bwrap but missing, fallback
+if [ "$CHROOT_METHOD" = "bwrap" ] && ! command -v bwrap >/dev/null 2>&1; then
+  log_internal WARN "bubblewrap requested but not found; falling back to chroot"
+  CHROOT_METHOD="chroot"
 fi
 
-# optional tools: git, gpg, unzip, 7z, strip
-# they will be tested before use
-
-### ----------------------------- YAML parser (lightweight) -----------------------------
-# This parser supports:
-# - top-level scalar keys: key: value
-# - block scalars with | or > for 'build:' and 'install:' preserving newlines or folding
-# - arrays with '- item' for simple lists (patches:), and arrays of maps for sources:
-#   sources:
-#     - url: https://...
-#       sha256: ...
-#       gpg: ...
+### -------------------- YAML parser (simples) --------------------
+# Suporta:
+# - key: value  (top-level)
+# - key: |  (bloco literal preservando \n)
+# - key: >  (bloco folded)
+# - arrays: - item
+# - sources: - url: ... sha256: ... gpg: ...
 #
-# It will populate shell variables:
-#   pkg_name, pkg_version, BUILD_CMDS, INSTALL_CMDS
-#   arrays: SOURCES_URLS[], SOURCES_SHA256[], SOURCES_GPG[]
-#   PATCHES[] and HOOKS_<stage>[] as bash arrays (stage names converted to uppercase underscore)
-#
+# Variáveis populadas:
+# pkg_name, pkg_version, BUILD_CMDS, INSTALL_CMDS
+# SOURCES_URLS[], SOURCES_SHA256[], SOURCES_GPG[]
+# PATCHES[] and HOOKS["stage"] string with ';;' separators
 SOURCES_URLS=()
 SOURCES_SHA256=()
 SOURCES_GPG=()
 PATCHES=()
-declare -A HOOKS # HOOKS["pre-download"]="cmd1;;cmd2"
+declare -A HOOKS
 
-# helper: trim leading spaces
-_ltrim() { sed -E 's/^[[:space:]]+//' <<<"$1"; }
-
-# parse the YAML file
 parse_metafile() {
   local file="$1"
-  # state variables
+  local last_top=""
   local in_block="" block_key="" block_indent=0
-  local current_array_key="" # for arrays of scalars like patches
-  local current_map=""       # for an item in array of maps (like sources)
-  while IFS= read -r line || [ -n "$line" ]; do
-    # remove CR
-    line="${line%$'\r'}"
-    # skip comments and blank lines when not in block
-    if [ -z "$in_block" ]; then
-      local tl
-      tl="$(echo "$line" | sed -e 's/^[[:space:]]*//')"
-      [ -z "$tl" ] && continue
-    fi
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    line="${raw%$'\r'}"
+    # strip leading and trailing
+    ltrim="$(echo "$line" | sed -e 's/^[[:space:]]*//')"
+    [ -z "$ltrim" ] && continue
+    # comments
+    if [[ "$ltrim" =~ ^# ]]; then continue; fi
 
-    # If currently inside a block scalar, capture lines until indentation less than block_indent
+    # If in block scalar (| or >)
     if [ -n "$in_block" ]; then
-      # if line is less indented than block_indent -> block ends
-      # measure leading spaces
-      leading="${line%%[! ]*}"
-      leading_len=${#leading}
+      # detect indentation less than block_indent to end block
+      leading_len=$(echo "$line" | sed -n 's/^\([[:space:]]*\).*$/\1/p' | awk '{print length}')
       if [ "$leading_len" -lt "$block_indent" ] && [ -n "$(echo "$line" | sed -e 's/^[[:space:]]*//')" ]; then
-        # end block
         in_block=""
         block_key=""
         block_indent=0
-        # reprocess this line as normal (fallthrough)
+        # re-process current line normally
       else
-        # append to the block variable preserving newlines
-        eval "$block_key"='+$'"'\n'"$(printf "%s\n" "$(echo "$line" | sed -e "s/^[[:space:]]\\{${block_indent}\\}//")")"
+        # append trimmed to variable (preserve newlines)
+        val="$(echo "$line" | sed -e "s/^[[:space:]]\\{${block_indent}\\}//")"
+        eval "$block_key=\"\${$block_key}\$val\n\""
         continue
       fi
     fi
 
-    # Trim left whitespace for parsing
-    stripped="$(echo "$line" | sed -e 's/^[[:space:]]*//')"
-
-    # Detect array item (starts with '- ')
-    if [[ "$stripped" =~ ^- ]]; then
-      # array item; determine parent key by looking back (we keep current_array_key)
-      # Example:
-      # sources:
-      #   - url: ...
-      #     sha256: ...
-      # patches:
-      #   - fix.patch
-      item="${stripped#- }"
-      # if item contains key: value -> it's a map entry under current map
-      if [[ "$item" =~ ^[A-Za-z0-9_\-]+:[[:space:]]*.* ]]; then
-        # begin a new map entry (used for sources)
-        current_map=""
-        # parse 'key: val' in this line
-        mapkey="${item%%:*}"
-        mapval="$(echo "${item#*:}" | sed -e 's/^ *//;s/ *$//')"
-        # start a new temporary associative array for the current map
-        declare -A tmpmap=()
-        tmpmap["$mapkey"]="$mapval"
-        current_map_keys=("$mapkey")
-        # store tmpmap to a temporary file representation: we'll capture following indented lines into it
-        # Keep it in variables: TMPMAP_KEY and values stored in TMPMAP_*
-        TMPMAP_KEYCOUNT=1
-        TMPMAP_KV="${mapkey}:::${mapval}"
-        # read following indented lines to capture rest of map entries
-        while IFS= read -r cont || [ -n "$cont" ]; do
-          # measure indentation
-          if [ -z "$cont" ]; then break; fi
-          prefix_len=$(echo "$cont" | sed -n 's/^\([[:space:]]*\).*$/\1/p' | awk '{print length}')
-          if [ "$prefix_len" -le 2 ]; then
-            # not indented enough => end of map block, re-process this line
-            # use REPLY-like trick: put it into a variable for next outer loop iteration
-            # We'll use a fifo approach by saving to a tmp file and then sourcing it back. Simpler: push it onto a temp file and then cat + process; due to complexity, break and allow next while outer read to pick it up (but we already consumed the line). To avoid complex refeed, keep this parser simpler: 'sources' map entries must be fully inline (no additional indented map lines). We'll support only map entries where all fields are on same indentation band or immediately subsequent lines with extra indent.
-            # fallback: if next line not indented > current indentation, break
+    # detect array item
+    if [[ "$ltrim" =~ ^- ]]; then
+      item="${ltrim#- }"
+      # if item contains 'key:' it's a map entry (like sources: - url: ...)
+      if [[ "$item" =~ ^[A-Za-z0-9_\-]+: ]]; then
+        # start a small map capture: this line plus following indented lines
+        map_kv=""
+        # first kv in this line
+        mk="${item%%:*}"
+        mv="${item#*: }"
+        map_kv="${map_kv}${mk}:::${mv};;"
+        # read following lines while indented
+        while IFS= read -r next || [ -n "$next" ]; do
+          nextline="${next%$'\r'}"
+          ntrim="$(echo "$nextline" | sed -e 's/^[[:space:]]*//')"
+          # break if not indented (no leading spaces)
+          if [[ "$nextline" =~ ^[^[:space:]] ]]; then
+            # push back line to input (uses bash trick: use a temporary file)
+            REPLY_LINE="$nextline"
             break
           fi
-          # else parse 'key: val' from cont (strip leading whitespace)
-          cont_stripped="$(echo "$cont" | sed -e 's/^[[:space:]]*//')"
-          if [[ "$cont_stripped" =~ ^([A-Za-z0-9_\-]+):[[:space:]]*(.*) ]]; then
-            k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
-            TMPMAP_KV="${TMPMAP_KV};;${k}:::${v}"
+          s="$(echo "$nextline" | sed -e 's/^[[:space:]]*//')"
+          if [[ "$s" =~ ^([A-Za-z0-9_\-]+):[[:space:]]*(.*)$ ]]; then
+            map_k="${BASH_REMATCH[1]}"; map_v="${BASH_REMATCH[2]}"
+            map_kv="${map_kv}${map_k}:::${map_v};;"
           fi
         done
-        # now TMPMAP_KV holds k:::v pairs separated by ';;'
-        # convert TMPMAP_KV for known fields (url, sha256, gpg)
-        IFS=';;' read -r -a kvs <<< "$TMPMAP_KV"
-        local _url="" _sha="" _gpg=""
-        for kv in "${kvs[@]}"; do
-          kf="${kv%%:::*}"
-          vf="${kv#*:::}"
-          case "$kf" in
-            url) _url="$vf" ;;
-            sha256) _sha="$vf" ;;
-            gpg) _gpg="$vf" ;;
-            *) ;; # ignore
+        # parse map_kv for known keys
+        url=""; sha=""; gpg=""
+        IFS=';;' read -r -a pairs <<< "$map_kv"
+        for p in "${pairs[@]}"; do
+          [ -z "$p" ] && continue
+          k="${p%%:::*}"; v="${p#*:::}"
+          case "$k" in
+            url) url="$v" ;;
+            sha256) sha="$v" ;;
+            gpg) gpg="$v" ;;
           esac
         done
-        if [ -n "$_url" ]; then
-          SOURCES_URLS+=("$_url")
-          SOURCES_SHA256+=("$_sha")
-          SOURCES_GPG+=("$_gpg")
+        if [ -n "$url" ]; then
+          SOURCES_URLS+=("$url")
+          SOURCES_SHA256+=("$sha")
+          SOURCES_GPG+=("$gpg")
         fi
-        continue
+        # if we broke early with REPLY_LINE, put it back by reading it via a temp file approach
+        if [ -n "${REPLY_LINE:-}" ]; then
+          # reinsert REPLY_LINE by using a small tmp file prepend hack: create temp with this line + rest of file
+          tmpf="$(mktemp)"
+          echo "${REPLY_LINE}" > "$tmpf"
+          # append remaining input into tmpf by reading the remainder of original file descriptor
+          cat >> "$tmpf"
+          # replace stdin for outer loop with tmpf
+          exec 0< "$tmpf"
+          REPLY_LINE=""
+        fi
       else
-        # item is scalar list element (e.g., patches)
-        if [ -n "$item" ]; then
-          # Append to PATCHES if we are in patches context (detect by last top-level key)
-          # naive approach: detect last non-empty top-level key by reading backwards - too complex
-          # Simpler: if the last seen top-level key name was 'patches' (stored in variable LAST_KEY), use that
-          if [ "${LAST_KEY:-}" = "patches" ]; then
-            PATCHES+=("$item")
-          else
-            # other simple arrays: treat as hooks list if LAST_KEY starts with hooks
-            if [[ "${LAST_KEY:-}" =~ ^hooks\. ]]; then
-              stage="${LAST_KEY#hooks.}"
-              # append command to HOOKS[stage]
-              if [ -n "${HOOKS[$stage]:-}" ]; then
-                HOOKS[$stage]="${HOOKS[$stage]};;${item}"
-              else
-                HOOKS[$stage]="${item}"
-              fi
+        # scalar array item (likely patches or hooks)
+        if [ "$last_top" = "patches" ]; then
+          PATCHES+=("$item")
+        elif [[ "$last_top" =~ ^hooks(\.|$) ]]; then
+          stage="${last_top#hooks.}"
+          if [ -z "$stage" ]; then stage="$item"; else
+            if [ -n "${HOOKS[$stage]:-}" ]; then
+              HOOKS[$stage]="${HOOKS[$stage]};;${item}"
+            else
+              HOOKS[$stage]="${item}"
             fi
           fi
         fi
-        continue
       fi
+      continue
     fi
 
-    # Not an array item. Look for 'key: value' or block scalar indicator
-    if [[ "$stripped" =~ ^([A-Za-z0-9_.-]+):[[:space:]]*(.*)$ ]]; then
+    # key: value or key: | or key: >
+    if [[ "$ltrim" =~ ^([A-Za-z0-9_.-]+):[[:space:]]*(.*)$ ]]; then
       key="${BASH_REMATCH[1]}"
       val="${BASH_REMATCH[2]}"
-      # Save last top-level key
-      LAST_KEY="$key"
-      # Block scalar?
-      if [[ "$val" =~ ^[|>]$ ]]; then
-        # enter block mode
-        in_block="yes"
-        block_key="$key"
-        block_indent="$(echo "$line" | sed -n 's/^\([[:space:]]*\).*$/\1/p' | awk '{print length}')"
-        # initialize variable empty (will append)
+      last_top="$key"
+      if [[ "$val" =~ ^\|$ ]]; then
+        in_block="yes"; block_key="$key"; block_indent=$(echo "$line" | sed -n 's/^\([[:space:]]*\).*$/\1/p' | awk '{print length}')
         eval "$key=\"\""
         continue
+      elif [[ "$val" =~ ^\>$ ]]; then
+        in_block="yes"; block_key="$key"; block_indent=$(echo "$line" | sed -n 's/^\([[:space:]]*\).*$/\1/p' | awk '{print length}')
+        eval "$key=\"\""
+        continue
+      else
+        # scalar
+        # strip quotes
+        val="$(echo "$val" | sed -e 's/^\"//' -e 's/\"$//' -e \"s/^'//\" -e \"s/'$//\")"
+        case "$key" in
+          name|pkgname) pkg_name="$val" ;;
+          version) pkg_version="$val" ;;
+          source|source_url|url) SOURCE_URL="$val" ;;
+          sha256) SHA256="$val" ;;
+          gpg|gpg_sig|gpg_url) GPG_SIG_URL="$val" ;;
+          build) BUILD_CMDS="$val" ;;
+          install) INSTALL_CMDS="$val" ;;
+          patches) last_top="patches" ;;
+          hooks) last_top="hooks" ;;
+          stage) META_STAGE="$val" ;;
+          *) eval "$key=\"\$val\"" ;; # generic assign
+        esac
       fi
-      # plain scalar
-      # remove quotes if present
-      val="$(echo "$val" | sed -e 's/^\"//' -e 's/\"$//' -e \"s/^'//\" -e \"s/'$//\")"
-      # Known keys
-      case "$key" in
-        name|pkgname) pkg_name="$val" ;;
-        version) pkg_version="$val" ;;
-        source|source_url|url) SOURCE_URL="$val" ;;
-        build) BUILD_CMDS="$val" ;;
-        install) INSTALL_CMDS="$val" ;;
-        patches) LAST_KEY="patches" ;; # next array items go to PATCHES
-        hooks)
-          # Expect hooks mapping lines to follow
-          LAST_KEY="hooks"
-          ;;
-        *)
-          # If matches hooks.<stage> e.g. hooks.pre-download: "cmd"
-          if [[ "$key" =~ ^hooks\.([A-Za-z0-9_-]+)$ ]]; then
-            stage="${BASH_REMATCH[1]}"
-            # value may be a command string or comma-separated list
-            HOOKS[$stage]="$val"
-          else
-            # Unknown key: create variable
-            eval "$key=\"\$val\""
-          fi
-          ;;
-      esac
-    else
-      # unrecognized line; ignore
-      continue
     fi
   done < "$file"
 
-  # final adjustments: if BUILD_CMDS or INSTALL_CMDS were empty and there is block scalar in variables with newlines, they already are set.
-  : "${pkg_name:=${PKG_NAME:-}}"
-  : "${pkg_version:=${PKG_VERSION:-}}"
-  # If a single SOURCE_URL provided by top-level 'source' key and SOURCES_URLS empty, use it
-  if [ -z "${SOURCES_URLS[*]:-}" ] && [ -n "${SOURCE_URL:-}" ]; then
+  # fallback: if SOURCE_URL set but SOURCES arrays empty, add it
+  if [ "${#SOURCES_URLS[@]}" -eq 0 ] && [ -n "${SOURCE_URL:-}" ]; then
     SOURCES_URLS+=("$SOURCE_URL")
     SOURCES_SHA256+=("${SHA256:-}")
     SOURCES_GPG+=("${GPG_SIG_URL:-}")
   fi
 }
 
-### ----------------------------- Utilities: system metrics & progress -----------------------------
-# fetch loadavg, approximate CPU% (using /proc/stat delta), memory used (in MB)
+### -------------------- Utilitários métricas / progresso --------------------
 _prev_idle=0; _prev_total=0
 cpu_percent() {
-  # reads /proc/stat first line
   read -r cpu user nice system idle iowait irq softirq steal guest < /proc/stat
   idle_now=$((idle + iowait))
   total_now=$((user + nice + system + idle + iowait + irq + softirq + steal))
-  if [ "$_prev_total" -eq 0 ]; then
-    _prev_idle=$idle_now; _prev_total=$total_now; echo "0"; return
-  fi
-  diff_idle=$((idle_now - _prev_idle))
-  diff_total=$((total_now - _prev_total))
+  if [ "$_prev_total" -eq 0 ]; then _prev_idle=$idle_now; _prev_total=$total_now; echo "0"; return; fi
+  diff_idle=$((idle_now - _prev_idle)); diff_total=$((total_now - _prev_total))
   _prev_idle=$idle_now; _prev_total=$total_now
   if [ "$diff_total" -le 0 ]; then echo "0"; return; fi
   usage=$((100 * (diff_total - diff_idle) / diff_total))
   echo "$usage"
 }
-
 mem_used_mb() {
-  # use /proc/meminfo MemTotal and MemAvailable
   awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {printf "%d", (t-a)/1024}' /proc/meminfo 2>/dev/null || echo "0"
 }
-
-# Progress bar: show name, [bar], percent, ETA, load, cpu, mem
 progress_draw() {
-  local name=$1 percent=$2 eta=$3
+  local name="$1" percent="$2" eta="$3"
   local loadavg="$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0.00)"
   local cpu=$(cpu_percent)
   local mem=$(mem_used_mb)
-  # bar length
-  local width=30
-  local filled=$((percent * width / 100))
-  local empty=$((width - filled))
+  local width=28
+  local filled=$((percent * width / 100)); local empty=$((width - filled))
   local bar="$(printf '%0.s█' $(seq 1 $filled))$(printf '%0.s░' $(seq 1 $empty))"
   printf "\r%s  [%s] %3d%% ETA:%s load:%s cpu:%s%% mem:%sMB" "$name" "$bar" "$percent" "$eta" "$loadavg" "$cpu" "$mem"
 }
-
-# ETA helper: estimate duration left given elapsed/time fraction
 eta_fmt() {
-  local secs=$1
-  printf "%02d:%02d:%02d" $((secs/3600)) $(((secs%3600)/60)) $((secs%60))
+  local s=$1; printf "%02d:%02d:%02d" $((s/3600)) $(((s%3600)/60)) $((s%60))
 }
 
-### ----------------------------- Cleanup trap -----------------------------
+### -------------------- Cleanup / traps --------------------
 TMP_DIRS=()
 cleanup_and_exit() {
-  local code="${1:-0}"
-  # remove temporary dirs we created
+  local code=${1:-0}
+  # cleanup temporários
   for d in "${TMP_DIRS[@]:-}"; do
-    if [ -n "$d" ] && [ -d "$d" ]; then
-      rm -rf "$d" 2>/dev/null || true
-    fi
+    [ -n "$d" ] && rm -rf "$d" 2>/dev/null || true
   done
-  # final newline for progress line
   if [ "$QUIET" = true ]; then printf "\n"; fi
-  log_internal INFO "Exiting porg_builder_mono.sh with code $code"
+  log_internal INFO "Exiting with code $code"
   exit "$code"
 }
 trap 'log_internal WARN "Interrupted by user"; cleanup_and_exit 130' INT
 trap 'cleanup_and_exit $?' EXIT
 
-### ----------------------------- Implement Steps -----------------------------
-# Parse metafile
-parse_metafile "$METAFILE"
-# set defaults if not present
-: "${pkg_name:=${pkg_name:-unknown}}"
+### -------------------- Orquestra pipeline --------------------
+# parse metafile
+METAFILE_PATH="$2"
+# In case user called: porg_builder.sh build /path/to/metafile
+# Accept also: porg_builder.sh build <metafile>
+if [ "$CMD" = "build" ]; then
+  if [ -z "${METAFILE_PATH:-}" ]; then METAFILE_PATH="$1"; fi
+fi
+if [ ! -f "$METAFILE_PATH" ]; then _die "Metafile not found: $METAFILE_PATH"; fi
+
+parse_metafile "$METAFILE_PATH"
+
+# set defaults and LFS bootstrap support
+: "${pkg_name:=${pkg_name:-unnamed}}"
 : "${pkg_version:=${pkg_version:-0.0.0}}"
 : "${BUILD_CMDS:=${BUILD_CMDS:-}}"
 : "${INSTALL_CMDS:=${INSTALL_CMDS:-}}"
+# If metafile declares stage: bootstrap, set DESTDIR_BASE to /mnt/lfs by default (unless overridden)
+if [ "${META_STAGE:-}" = "bootstrap" ]; then
+  : "${DESTDIR_BASE:=/mnt/lfs}"
+fi
 
 PKG_ID="${pkg_name}-${pkg_version}"
 WORK_PKG_DIR="${WORKDIR}/${PKG_ID}"
@@ -451,69 +377,51 @@ DESTDIR="${DESTDIR_BASE}/${PKG_ID}"
 mkdir -p "$WORK_PKG_DIR" "$DESTDIR"
 TMP_DIRS+=("$WORK_PKG_DIR")
 
-log_internal INFO "Parsed metafile: name=${pkg_name}, version=${pkg_version}"
-log_internal INFO "Work dir: $WORK_PKG_DIR, Destdir: $DESTDIR"
+log_internal INFO "Parsed metafile: ${METAFILE_PATH}"
+log_internal INFO "Package: ${PKG_ID}; workdir: ${WORK_PKG_DIR}; destdir: ${DESTDIR}"
 
 # Optional cleaning
-if [ "$CLEAN_BEFORE" = true ]; then
-  log_internal INFO "Cleaning workdir and cache per request"
+if [ "${CLEAN_BEFORE:-false}" = true ]; then
+  log_internal INFO "Cleaning requested: cleaning workdir and cache"
   rm -rf "$WORK_PKG_DIR" "$CACHE_DIR"/* 2>/dev/null || true
   mkdir -p "$WORK_PKG_DIR"
 fi
 
-# Steps list
-STEPS=(download verify extract patch build install strip package expand)
-ACTIVE_STEPS=()
-# Determine active steps based on metafile contents and config
-ACTIVE_STEPS+=("download")
-ACTIVE_STEPS+=("verify")   # verify is attempted if checksum/gpg provided
-ACTIVE_STEPS+=("extract")
-if [ "${#PATCHES[@]}" -gt 0 ]; then ACTIVE_STEPS+=("patch"); fi
-ACTIVE_STEPS+=("build")
-ACTIVE_STEPS+=("install")
-if [ "$STRIP_BINARIES" = "true" ]; then ACTIVE_STEPS+=("strip"); fi
-ACTIVE_STEPS+=("package")
-if [ "$DO_EXPAND" = true ] || [ "${EXPAND_TO_ROOT:-false}" = "true" ]; then ACTIVE_STEPS+=("expand"); fi
+# Determine active steps
+ACT_STEPS=()
+ACT_STEPS+=(download verify extract)
+if [ "${#PATCHES[@]}" -gt 0 ]; then ACT_STEPS+=(patch); fi
+ACT_STEPS+=(build install)
+if [ "$STRIP_BINARIES" = "true" ]; then ACT_STEPS+=(strip); fi
+ACT_STEPS+=(package)
+# expand if requested via -i or metafile EXPAND_TO_ROOT or variable DO_EXPAND
+DO_EXPAND="${EXPORT_INSTALL:-false}"
+if [ "${DO_EXPAND}" = true ] || [ "${META_EXPAND:-false}" = "true" ]; then ACT_STEPS+=(expand); fi
 
-TOTAL_STEPS=${#ACTIVE_STEPS[@]}
-STEP_IDX=0
+TOTAL=${#ACT_STEPS[@]}; IDX=0
 
-# helpers to mark step and show progress
-start_step() {
-  STEP_IDX=$((STEP_IDX + 1))
-  STEP_NAME="$1"
-  log_internal INFO "STEP [$STEP_IDX/$TOTAL_STEPS] $STEP_NAME start"
-  step_start_time=$(date +%s)
-}
-end_step() {
-  local rc=${1:-0}
-  step_end_time=$(date +%s)
-  duration=$((step_end_time - step_start_time))
-  log_internal INFO "STEP [$STEP_IDX/$TOTAL_STEPS] $STEP_NAME done (duration ${duration}s)"
-}
+start_step() { IDX=$((IDX+1)); STNAME="$1"; ST_START=$(date +%s); log_internal INFO "STEP [$IDX/$TOTAL] ${STNAME} started"; }
+end_step() { local rc=${1:-0}; ST_END=$(date +%s); log_internal INFO "STEP [$IDX/$TOTAL] ${STNAME} finished (duration $((ST_END-ST_START))s)"; }
 
-# ----------------------------- Download -----------------------------
+### 1) DOWNLOAD
 start_step "download"
-
-# Try each source entry in SOURCES_URLS in order
-downloaded_file=""
-for idx in "${!SOURCES_URLS[@]}"; do
-  url="${SOURCES_URLS[$idx]}"
-  sha="${SOURCES_SHA256[$idx]:-}"
-  gpg="${SOURCES_GPG[$idx]:-}"
+downloaded=""
+for i in "${!SOURCES_URLS[@]}"; do
+  url="${SOURCES_URLS[$i]}"
+  sha="${SOURCES_SHA256[$i]:-}"
+  gpg="${SOURCES_GPG[$i]:-}"
   if [[ "$url" =~ ^git\+ ]]; then
     require_tool git
     repo="${url#git+}"
     dest="${CACHE_DIR}/git-$(basename "$repo" .git)"
     if [ -d "$dest/.git" ]; then
-      log_internal INFO "Refreshing git repo ${repo}"
+      log_internal INFO "Refreshing git ${repo}"
       git -C "$dest" fetch --all --tags --prune || true
     else
-      log_internal INFO "Cloning git repo ${repo} -> $dest"
+      log_internal INFO "Cloning ${repo} -> $dest"
       git clone --depth 1 "$repo" "$dest" || { log_internal WARN "git clone failed: $repo"; continue; }
     fi
-    downloaded_file="$dest"
-    # no verify for git here except optional patches; break
+    downloaded="$dest"
     break
   else
     fname="$(basename "$url")"
@@ -521,339 +429,267 @@ for idx in "${!SOURCES_URLS[@]}"; do
     mkdir -p "$CACHE_DIR"
     if [ -f "$out" ]; then
       log_internal INFO "Using cached $out"
-      downloaded_file="$out"
+      downloaded="$out"
     else
-      # download with progress; use curl with --progress-bar unless QUIET; but we want custom spinner/progress
       log_internal INFO "Downloading $url -> $out"
-      # Start curl in background with -sS to suppress progress; track bytes to compute percent with Content-Length
-      # Try to get content length
-      content_length=$(curl -sI "$url" | awk -F': ' '/^Content-Length:/ {print $2}' | tr -d '\r\n' || echo "")
-      # start curl
+      # attempt to get content-length
+      cl=$(curl -sI "$url" | awk -F': ' '/^Content-Length:/ {print $2}' | tr -d '\r\n' || echo "")
       curl -L --fail --output "$out.part" "$url" &
-      curl_pid=$!
-      # show progress while curl running
+      cpid=$!
       if [ "$QUIET" = true ]; then
-        # compute basic progress by checking file size vs content_length
-        start_ts=$(date +%s); last_size=0
-        while kill -0 "$curl_pid" 2>/dev/null; do
-          sleep 1
-          if [ -n "$content_length" ] && [ "$content_length" -gt 0 ]; then
-            cur_size=$(stat -c%s "$out.part" 2>/dev/null || echo 0)
-            percent=$((cur_size * 100 / content_length))
+        start_ts=$(date +%s)
+        while kill -0 $cpid 2>/dev/null; do
+          if [ -n "$cl" ] && [ "$cl" -gt 0 ]; then
+            cur=$(stat -c%s "$out.part" 2>/dev/null || echo 0)
+            pct=$((cur * 100 / cl))
             elapsed=$(( $(date +%s) - start_ts ))
-            if [ "$percent" -gt 0 ]; then
-              est_total=$((elapsed * 100 / percent))
-              left=$((est_total - elapsed))
-            else
-              left=0
-            fi
-            eta=$(eta_fmt $left)
-            progress_draw "$pkg_name" "$percent" "$eta"
+            if [ "$pct" -gt 0 ]; then
+              est_total=$((elapsed * 100 / pct)); left=$((est_total - elapsed)); eta=$(eta_fmt $left)
+            else eta="??:??:??"; fi
+            progress_draw "$PKG_ID" "$pct" "$eta"
           else
-            # unknown size: spinner only
-            printf "\r%s [ downloading... ]" "$pkg_name"
+            # spinner fallback
+            printf "\r%s  [ downloading... ]" "$PKG_ID"
           fi
+          sleep 0.6
         done
-        wait "$curl_pid" || { rm -f "$out.part"; log_internal WARN "curl failed"; continue; }
+        wait $cpid || { rm -f "$out.part"; log_internal WARN "curl failed for $url"; continue; }
         printf "\n"
       else
-        wait "$curl_pid" || { rm -f "$out.part"; log_internal WARN "curl failed"; continue; }
+        wait $cpid || { rm -f "$out.part"; log_internal WARN "curl failed for $url"; continue; }
       fi
       mv "$out.part" "$out"
-      downloaded_file="$out"
+      downloaded="$out"
     fi
   fi
 
-  # verify if sha/gpg provided
+  # verify if sha/gpg present
   if [ -n "$sha" ]; then
     require_tool sha256sum
-    log_internal INFO "Verifying sha256 for $downloaded_file"
-    if ! echo "$sha  $downloaded_file" | sha256sum -c - >/dev/null 2>&1; then
-      log_internal WARN "sha256 mismatch for $downloaded_file; trying next source"
-      rm -f "$downloaded_file"
-      downloaded_file=""
+    if ! echo "$sha  $downloaded" | sha256sum -c - >/dev/null 2>&1; then
+      log_internal WARN "sha256 mismatch for $downloaded; trying next source"
+      rm -f "$downloaded"
+      downloaded=""
       continue
     fi
   fi
   if [ -n "$gpg" ]; then
     require_tool gpg curl
-    sigfile="$CACHE_DIR/$(basename "$gpg")"
-    curl -L --fail -o "$sigfile.part" "$gpg" && mv "$sigfile.part" "$sigfile"
-    if ! gpg --verify "$sigfile" "$downloaded_file" >/dev/null 2>&1; then
-      log_internal WARN "GPG verify failed for $downloaded_file; trying next source"
-      rm -f "$downloaded_file"
-      downloaded_file=""
-      continue
+    sigf="$CACHE_DIR/$(basename "$gpg")"
+    curl -L --fail -o "$sigf.part" "$gpg" && mv "$sigf.part" "$sigf"
+    if ! gpg --verify "$sigf" "$downloaded" >/dev/null 2>&1; then
+      log_internal WARN "GPG verify failed; trying next source"
+      rm -f "$downloaded"; downloaded=""; continue
     fi
   fi
-  # if we got here, download + verify succeeded
   break
 done
-
-[ -n "$downloaded_file" ] || _die "No source could be downloaded and verified"
+[ -n "$downloaded" ] || _die "Nenhuma fonte válida foi baixada/verificada"
 end_step 0
 
-# ----------------------------- Extract -----------------------------
+### 2) EXTRACT
 start_step "extract"
-EXTRACT_DIR="${WORK_PKG_DIR}/src"
-rm -rf "$EXTRACT_DIR"
-mkdir -p "$EXTRACT_DIR"
-
-if [ -d "$downloaded_file" ]; then
-  # git or directory
-  log_internal INFO "Source is directory (git); copying to extract dir"
-  cp -a "$downloaded_file"/. "$EXTRACT_DIR"/
+EXDIR="${WORK_PKG_DIR}/src"
+rm -rf "$EXDIR"; mkdir -p "$EXDIR"
+if [ -d "$downloaded" ]; then
+  log_internal INFO "Fonte é diretório (git); copiando"
+  cp -a "$downloaded"/. "$EXDIR"/
 else
-  fn="$downloaded_file"
+  fn="$downloaded"
   case "$fn" in
     *.tar.zst|*.tzst)
       require_tool tar zstd
-      # compute size for progress estimate
-      total_size=$(stat -c%s "$fn" 2>/dev/null || echo 0)
-      if [ "$QUIET" = true ] && [ "$total_size" -gt 0 ]; then
-        # extract in background while watching file growth of decompressed stream is complex; we'll show spinner
-        (tar --use-compress-program=unzstd -xf "$fn" -C "$EXTRACT_DIR") &
-        pid=$!; while kill -0 $pid 2>/dev/null; do progress_draw "$pkg_name" 0 "??:??:??"; sleep 0.3; done; printf "\n"
-        wait $pid
+      if [ "$QUIET" = true ]; then
+        (tar --use-compress-program=unzstd -xf "$fn" -C "$EXDIR") & pid=$!
+        while kill -0 $pid 2>/dev/null; do progress_draw "$PKG_ID" 0 "??:??:??"; sleep 0.6; done; printf "\n"; wait $pid
       else
-        tar --use-compress-program=unzstd -xf "$fn" -C "$EXTRACT_DIR"
+        tar --use-compress-program=unzstd -xf "$fn" -C "$EXDIR"
       fi
       ;;
-    *.tar.xz|*.txz)
-      require_tool tar xz
-      tar -xf "$fn" -C "$EXTRACT_DIR"
-      ;;
-    *.tar.gz|*.tgz)
-      require_tool tar gzip
-      tar -xf "$fn" -C "$EXTRACT_DIR"
-      ;;
-    *.zip)
-      require_tool unzip
-      unzip -qq "$fn" -d "$EXTRACT_DIR"
-      ;;
-    *.7z)
-      require_tool 7z
-      7z x -y -o"$EXTRACT_DIR" "$fn" >/dev/null
-      ;;
-    *)
-      _die "Unsupported archive format for extraction: $fn"
-      ;;
+    *.tar.xz|*.txz) require_tool tar xz; tar -xf "$fn" -C "$EXDIR" ;;
+    *.tar.gz|*.tgz) require_tool tar gzip; tar -xf "$fn" -C "$EXDIR" ;;
+    *.zip) require_tool unzip; unzip -qq "$fn" -d "$EXDIR" ;;
+    *.7z) require_tool 7z; 7z x -y -o"$EXDIR" "$fn" >/dev/null ;;
+    *) _die "Formato de arquivo não suportado: $fn" ;;
   esac
 fi
-
-# find top-level dir if any
-topdir=$(find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)
-if [ -n "$topdir" ]; then
-  SRC_DIR="$topdir"
-else
-  SRC_DIR="$EXTRACT_DIR"
-fi
+# pick top-level dir
+topd=$(find "$EXDIR" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)
+if [ -n "$topd" ]; then SRC_DIR="$topd"; else SRC_DIR="$EXDIR"; fi
 end_step 0
 
-# ----------------------------- Patch -----------------------------
+### 3) PATCH
 if [ "${#PATCHES[@]}" -gt 0 ]; then
   start_step "patch"
   require_tool patch
-  run_hooks_pre_download() { :; } # placeholder if needed
   for p in "${PATCHES[@]}"; do
-    # patch path may be absolute or relative to metafile dir
-    if [ -f "$p" ]; then ppath="$p"; else ppath="$(dirname "$METAFILE")/$p"; fi
-    if [ ! -f "$ppath" ]; then _die "Patch not found: $ppath"; fi
-    log_internal INFO "Applying patch $ppath"
-    (cd "$SRC_DIR" && patch -p1 < "$ppath") || _die "Patch failed: $ppath"
+    if [ -f "$p" ]; then ppath="$p"; else ppath="$(dirname "$METAFILE_PATH")/$p"; fi
+    [ -f "$ppath" ] || _die "Patch não encontrado: $ppath"
+    log_internal INFO "Aplicando patch $ppath"
+    (cd "$SRC_DIR" && patch -p1 < "$ppath") || _die "Falha ao aplicar patch $ppath"
   done
+  # also check for patches in /usr/ports/<pkg>/patches
+  pkg_par_dir="$(dirname "$METAFILE_PATH")"
+  if [ -d "$pkg_par_dir/patches" ]; then
+    for p in "$pkg_par_dir/patches"/*.patch; do
+      [ -f "$p" ] || continue
+      log_internal INFO "Aplicando patch local $p"
+      (cd "$SRC_DIR" && patch -p1 < "$p") || _die "Falha ao aplicar patch $p"
+    done
+  fi
   end_step 0
 fi
 
-# ----------------------------- Hooks -----------------------------
-# run_hooks <stage>
+### Hooks pre/post-download/extract handled where appropriate
 run_hooks() {
   local stage="$1"
-  log_internal INFO "Running hooks stage=$stage"
-  # package-local hooks: HOOKS associative array entries (from parse stage)
+  log_internal INFO "Executing hooks: $stage"
+  # package-local hooks parsed into HOOKS associative array
   if [ -n "${HOOKS[$stage]:-}" ]; then
     IFS=';;' read -r -a cmds <<< "${HOOKS[$stage]}"
     for c in "${cmds[@]}"; do
       [ -z "$c" ] && continue
       log_internal INFO "pkg-hook: $c"
-      bash -c "$c" || log_internal WARN "pkg-hook failed: $c"
+      bash -c "$c" || log_internal WARN "pkg-hook falhou: $c"
     done
   fi
-  # global hooks dir
+  # global hooks
   hd="$HOOK_DIR/$stage"
   if [ -d "$hd" ]; then
     for h in "$hd"/*; do
       [ -x "$h" ] || continue
       log_internal INFO "global-hook: $h"
-      "$h" || log_internal WARN "global hook failed: $h"
+      "$h" || log_internal WARN "global hook falhou: $h"
     done
   fi
 }
 
-run_hooks "pre-download"
-run_hooks "post-download"
+run_hooks "pre-build"
 
-# ----------------------------- Build in chroot (bubblewrap) -----------------------------
+### 4) BUILD (bwrap)
 start_step "build"
-
-# Prepare chroot root dir
 CHROOT_ROOT="${WORK_PKG_DIR}/chroot_root"
 rm -rf "$CHROOT_ROOT" || true
 mkdir -p "$CHROOT_ROOT/$pkg_name"
-# copy source into chroot root
 cp -a "$SRC_DIR"/. "$CHROOT_ROOT/$pkg_name"/
-
-# construct build script to run inside chroot
-# we want to export DESTDIR inside chroot as /DESTDIR_REL where DESTDIR_REL is the DESTDIR path without leading /
 DESTDIR_REL="${DESTDIR#/}"
+
+# prepare build script
+# ensure build/install commands preserve newlines
 BUILD_SCRIPT=""
-if [ -n "${BUILD_CMDS:-}" ]; then
-  # ensure commands separated; keep newlines
-  BUILD_SCRIPT+="${BUILD_CMDS};"
-fi
+if [ -n "${BUILD_CMDS:-}" ]; then BUILD_SCRIPT+="${BUILD_CMDS};"; fi
 if [ -n "${INSTALL_CMDS:-}" ]; then
-  # run install under fakeroot
-  BUILD_SCRIPT+="fakeroot sh -c '${INSTALL_CMDS//\'/\'\\\'\'}';"
+  safe_install_cmds="${INSTALL_CMDS//\'/\'\\\'\'}"
+  BUILD_SCRIPT+="fakeroot sh -c '${safe_install_cmds}';"
 fi
 
-# run pre-build hooks
-run_hooks "pre-build"
-
-# Run with bubblewrap preferred
+# execute
 if [ "$CHROOT_METHOD" = "bwrap" ] && command -v bwrap >/dev/null 2>&1; then
-  # Mount minimal FS: bind chroot root as /, bind /usr read-only, mount proc/dev etc.
-  # We'll run sh -c 'cd /<pkg_name> ; export DESTDIR=/<DESTDIR_REL> ; <build_script>'
-  inner_cmd="set -euo pipefail; export JOBS=${JOBS}; export DESTDIR=/${DESTDIR_REL}; cd /${pkg_name}; ${BUILD_SCRIPT}"
-  # run in background and show progress
+  inner="set -euo pipefail; export JOBS=${JOBS}; export DESTDIR=/${DESTDIR_REL}; cd /${pkg_name}; ${BUILD_SCRIPT}"
   if [ "$QUIET" = true ]; then
-    bwrap --ro-bind "$CHROOT_ROOT" / --dev /dev --proc /proc --tmpfs /tmp --ro-bind /usr /usr --unshare-net /bin/sh -c "$inner_cmd" &
-    bpid=$!
-    # basic percent estimate: we can't know exact; show spinner and CPU/mem stats
-    while kill -0 "$bpid" 2>/dev/null; do
+    bwrap --ro-bind "$CHROOT_ROOT" / --dev /dev --proc /proc --tmpfs /tmp --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 --unshare-net /bin/sh -c "$inner" &
+    bp=$!
+    # show CPU/MEM while building
+    while kill -0 $bp 2>/dev/null; do
       cpu=$(cpu_percent); mem=$(mem_used_mb)
-      printf "\rBuilding %s ... CPU:%s%% MEM:%sMB" "$pkg_name" "$cpu" "$mem"
+      printf "\rBuilding %s ... CPU:%s%% MEM:%sMB" "$PKG_ID" "$cpu" "$mem"
       sleep 0.6
     done
-    wait "$bpid" || _die "Build failed inside bwrap"
+    wait $bp || _die "Erro no build dentro do bwrap"
     printf "\n"
   else
-    # verbose mode: stream output
-    bwrap --ro-bind "$CHROOT_ROOT" / --dev /dev --proc /proc --tmpfs /tmp --ro-bind /usr /usr --unshare-net /bin/sh -c "$inner_cmd"
+    bwrap --ro-bind "$CHROOT_ROOT" / --dev /dev --proc /proc --tmpfs /tmp --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 --unshare-net /bin/sh -c "$inner"
   fi
 else
-  # fallback to chroot - requires root
+  # fallback chroot
   if [ "$(id -u)" -ne 0 ]; then
-    log_internal WARN "chroot fallback requires root; running with available privileges (may fail)"
+    log_internal WARN "Fallback chroot pode exigir root; prosseguindo com privilégios atuais"
   fi
-  inner_cmd="set -euo pipefail; export JOBS=${JOBS}; export DESTDIR=/${DESTDIR_REL}; cd /${pkg_name}; ${BUILD_SCRIPT}"
-  chroot "$CHROOT_ROOT" /bin/sh -c "$inner_cmd"
+  chroot "$CHROOT_ROOT" /bin/sh -c "set -euo pipefail; export JOBS=${JOBS}; export DESTDIR=/${DESTDIR_REL}; cd /${pkg_name}; ${BUILD_SCRIPT}"
 fi
-
 run_hooks "post-build"
 end_step 0
 
-# ----------------------------- install stage -----------------------------
+### 5) INSTALL (merge from chroot's DESTDIR)
 start_step "install"
-# Files should have been installed into CHROOT_ROOT/${DESTDIR_REL}
-INSTALLED_ROOT="${CHROOT_ROOT}/${DESTDIR_REL}"
-if [ -d "$INSTALLED_ROOT" ]; then
+INST_ROOT="${CHROOT_ROOT}/${DESTDIR_REL}"
+if [ -d "$INST_ROOT" ]; then
   mkdir -p "$DESTDIR"
-  cp -a "$INSTALLED_ROOT"/. "$DESTDIR"/
-  log_internal INFO "Installed files merged into $DESTDIR"
+  cp -a "$INST_ROOT"/. "$DESTDIR"/
+  log_internal INFO "Arquivos instalados mesclados em $DESTDIR"
 else
-  log_internal WARN "No installed files found at $INSTALLED_ROOT; perhaps install commands put files elsewhere"
+  log_internal WARN "Nenhum arquivo instalado em $INST_ROOT (verifique INSTALL_CMDS)"
 fi
 run_hooks "post-install"
 end_step 0
 
-# ----------------------------- strip binaries -----------------------------
+### 6) STRIP (opcional)
 if [ "$STRIP_BINARIES" = "true" ]; then
   start_step "strip"
   if command -v strip >/dev/null 2>&1 && command -v file >/dev/null 2>&1; then
     while IFS= read -r -d '' f; do
       if file "$f" | grep -q "ELF"; then
-        strip --strip-unneeded "$f" || log_internal WARN "strip failed for $f"
+        strip --strip-unneeded "$f" || log_internal WARN "strip falhou: $f"
       fi
     done < <(find "$DESTDIR" -type f -print0)
   else
-    log_internal WARN "strip or file not available; skipping strip"
+    log_internal WARN "strip/file não disponíveis; pulando strip"
   fi
   end_step 0
 fi
 
-# ----------------------------- package -----------------------------
+### 7) PACKAGE (.tar.zst)
 start_step "package"
 mkdir -p "${WORK_PKG_DIR}/packages"
 pkg_base="${WORK_PKG_DIR}/packages/${PKG_ID}.tar"
 tar -C "$DESTDIR" -cf "$pkg_base" .
-pkg_file=""
-case "$PACKAGE_FORMAT" in
-  tar.zst)
-    if command -v zstd >/dev/null 2>&1; then
-      zstd -T0 -19 "$pkg_base" -o "${pkg_base}.zst"
-      pkg_file="${pkg_base}.zst"
-    else
-      log_internal WARN "zstd not available; leaving uncompressed tar"
-      pkg_file="${pkg_base}"
-    fi
-    ;;
-  tar.xz)
-    if command -v xz >/dev/null 2>&1; then
-      xz -9 "$pkg_base"
-      pkg_file="${pkg_base}.xz"
-    else
-      pkg_file="${pkg_base}"
-    fi
-    ;;
-  *)
-    pkg_file="${pkg_base}"
-    ;;
-esac
-log_internal INFO "Package created: $pkg_file"
+pkg_file="$pkg_base"
+if [ "$PACKAGE_FORMAT" = "tar.zst" ] && command -v zstd >/dev/null 2>&1; then
+  zstd -T0 -19 "$pkg_base" -o "${pkg_base}.zst"
+  pkg_file="${pkg_base}.zst"
+elif [ "$PACKAGE_FORMAT" = "tar.xz" ] && command -v xz >/dev/null 2>&1; then
+  xz -9 "$pkg_base"
+  pkg_file="${pkg_base}.xz"
+fi
+log_internal INFO "Pacote criado: $pkg_file"
 run_hooks "post-package"
 end_step 0
 
-# ----------------------------- expand into / (dangerous) -----------------------------
-if [ "$DO_EXPAND" = true ] || [ "${EXPAND_TO_ROOT:-false}" = "true" ]; then
+### 8) EXPAND into / (opcional / perigoso)
+if [ "${DO_EXPAND:-false}" = true ] || [ "${META_EXPAND:-false}" = "true" ]; then
   start_step "expand"
   if [ "$AUTO_YES" != true ]; then
-    printf "\nWARNING: You are about to extract package '%s' into / (root). This will overwrite files.\nType 'yes' to proceed: " "$pkg_file" >&2
+    printf "\nATENÇÃO: vai extrair '%s' em / (root). Isso sobrescreverá arquivos.\nDigite 'yes' para confirmar: " "$pkg_file" >&2
     read -r ans
     if [ "$ans" != "yes" ]; then
-      log_internal WARN "User declined expand-root; skipping"
+      log_internal WARN "Usuário cancelou expand-root"
       end_step 1
-      DO_EXPAND=false
     fi
   fi
-  if [ "$DO_EXPAND" = true ]; then
-    run_hooks "pre-expand-root"
-    case "$pkg_file" in
-      *.zst) zstd -d "$pkg_file" -c | tar -xf - -C / ;;
-      *.tar) tar -xf "$pkg_file" -C / ;;
-      *.xz) xz -d "$pkg_file" -c | tar -xf - -C / ;;
-      *) _die "Unsupported package type to expand: $pkg_file" ;;
-    esac
-    run_hooks "post-expand-root"
-    log_internal INFO "Package expanded into /"
-  fi
+  run_hooks "pre-expand-root"
+  case "$pkg_file" in
+    *.zst) zstd -d "$pkg_file" -c | tar -xf - -C / ;;
+    *.tar) tar -xf "$pkg_file" -C / ;;
+    *.xz) xz -d "$pkg_file" -c | tar -xf - -C / ;;
+    *) _die "Tipo de pacote não suportado para expand: $pkg_file" ;;
+  esac
+  run_hooks "post-expand-root"
+  log_internal INFO "Pacote expandido em /"
   end_step 0
 fi
 
-# ----------------------------- final summary -----------------------------
-total_end=$(date +%s)
-# compute overall duration from log file header time: we stored start earlier; approximate by last step durations sum not available -> compute by file mtimes
-log_internal INFO "Build finished for ${PKG_ID}. Package: ${pkg_file}"
-# Optionally, call dependency manager or DB updater if configured
+### final summary and optional hooks to deps/db managers
+log_internal INFO "Build finalizado: ${PKG_ID}"
+log_internal INFO "Pacote disponível em: $pkg_file"
+
+# notify dependency manager / registro if configured
 if [ -n "$DEPS_CMD" ] && command -v "$DEPS_CMD" >/dev/null 2>&1; then
-  log_internal INFO "Invoking dependency manager: $DEPS_CMD"
-  "$DEPS_CMD" --register "$PKG_ID" --manifest "$pkg_file" || log_internal WARN "deps manager returned non-zero"
+  log_internal INFO "Chamando resolvedor de dependências: $DEPS_CMD"
+  "$DEPS_CMD" --register "$PKG_ID" --manifest "$pkg_file" || log_internal WARN "DEPS_CMD retornou código não-zero"
 fi
 if [ -n "$DB_CMD" ] && command -v "$DB_CMD" >/dev/null 2>&1; then
-  log_internal INFO "Registering package in DB: $DB_CMD"
-  "$DB_CMD" add --name "$pkg_name" --version "$pkg_version" --file "$pkg_file" || log_internal WARN "db add returned non-zero"
+  log_internal INFO "Registrando pacote no DB: $DB_CMD"
+  "$DB_CMD" add --name "$pkg_name" --version "$pkg_version" --file "$pkg_file" || log_internal WARN "DB_CMD retornou código não-zero"
 fi
 
-# cleanup temporary dirs if desired (kept by default)
-log_internal INFO "All done. Package available at: $pkg_file"
-# success exit (trap will run cleanup)
 exit 0
