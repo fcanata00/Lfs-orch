@@ -1,0 +1,112 @@
+# ======================================================================
+#  Porg Metafile for GCC 13.2.0
+#  Path: /usr/ports/base/gcc/gcc-13.2.0.yaml
+# ======================================================================
+
+name: gcc
+version: 13.2.0
+category: base
+release: 1
+summary: The GNU Compiler Collection
+description: |
+  The GNU Compiler Collection includes front ends for C, C++, Objective-C,
+  Fortran, Ada, Go, and D, as well as libraries for these languages.
+
+homepage: https://gcc.gnu.org/
+license: GPL-3.0-or-later
+
+source:
+  - url: https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+    checksum: sha256=4c7b6b1c8cb00a0d92e0b56b7c5d62a7b2f6dc5f8b91dcfcd787b38aef3b64b2
+  - url: https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz
+    checksum: sha256=13dfd90df2f7a7abf3f62e08a0e3a1a028a5a2e52b7a1df5f3b3dfcae7f4a409
+  - url: https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
+    checksum: sha256=5e8d8e2d2f23112abf97e1f64605a8f1486e2f17dbf69a3ce69a5bfa3f5f9a82
+  - url: https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
+    checksum: sha256=17503d2d3f5230d2617b7a1efcf1aa4e1c66f1f8917b6a7ad8a8a6b2ab0e2f4a
+
+patches:
+  - name: gcc-13.2.0-libdir.patch
+    url: https://example.com/patches/gcc-13.2.0-libdir.patch
+  - name: gcc-nofixinc.patch
+    url: https://example.com/patches/gcc-nofixinc.patch
+
+dependencies:
+  build:
+    - gmp
+    - mpfr
+    - mpc
+    - isl
+  runtime:
+    - glibc
+    - binutils
+    - zlib
+
+provides:
+  - gcc
+  - g++
+  - cpp
+  - c++
+
+conflicts:
+  - tinycc
+  - clang
+
+build:
+  bootstrap: true
+  chroot: /mnt/lfs
+  parallel: true
+  env:
+    CC: gcc
+    CXX: g++
+    MAKEFLAGS: "-j$(nproc)"
+  configure_flags:
+    - --prefix=/usr
+    - --libdir=/usr/lib
+    - --libexecdir=/usr/lib
+    - --enable-languages=c,c++
+    - --enable-shared
+    - --enable-threads=posix
+    - --enable-checking=release
+    - --disable-multilib
+    - --disable-bootstrap
+    - --with-system-zlib
+  build_dir: build
+  destdir: /mnt/lfs/build/gcc-13.2.0-dest
+  fakeroot: true
+
+install:
+  strip: true
+  symlinks:
+    - /usr/bin/cc -> /usr/bin/gcc
+  postinstall:
+    - ldconfig
+    - update-alternatives --install /usr/bin/cc cc /usr/bin/gcc 50
+
+hooks:
+  pre_download: /usr/ports/base/gcc/hooks/pre_download.sh
+  post_download: /usr/ports/base/gcc/hooks/post_download.sh
+  pre_patch: /usr/ports/base/gcc/hooks/pre_patch.sh
+  post_patch: /usr/ports/base/gcc/hooks/post_patch.sh
+  pre_build: /usr/ports/base/gcc/hooks/pre_build.sh
+  post_build: /usr/ports/base/gcc/hooks/post_build.sh
+  pre_install: /usr/ports/base/gcc/hooks/pre_install.sh
+  post_install: /usr/ports/base/gcc/hooks/post_install.sh
+  pre_remove: /usr/ports/base/gcc/hooks/pre_remove.sh
+  post_remove: /usr/ports/base/gcc/hooks/post_remove.sh
+
+files:
+  manifest: /var/lib/porg/db/gcc-13.2.0.manifest
+  logfile: /var/log/porg/build/gcc-13.2.0.log
+
+audit:
+  check_libs: true
+  check_links: true
+  check_deps: true
+  check_vulns: true
+
+metadata:
+  maintainer: Fernando Canata <fernando@example.com>
+  repo: git+https://github.com/fernando/porg-ports.git
+  branch: main
+  updated: 2025-10-06
