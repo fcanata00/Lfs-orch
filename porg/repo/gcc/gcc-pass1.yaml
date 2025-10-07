@@ -1,35 +1,103 @@
+# gcc-pass1.yaml
+# GCC Pass 1 - cross-compiler bootstrap (LFS-style)
+# Based on: https://www.linuxfromscratch.org/lfs/view/stable/chapter05/gcc-pass1.html
+
 name: gcc
-version: 13.2.0
+version: "15.2.0"
 stage: pass1
 category: base
-description: "GNU Compiler Collection (Pass 1)"
-chroot: true
-destdir: build/gcc-13.2.0-dest
+description: "GCC (pass1) - bootstrap compiler for toolchain"
+license: "GPL-3.0"
+homepage: "https://gcc.gnu.org/"
+
+# Sources: main tarball and required libs (MPFR, GMP, MPC). Prefer to vendor them into GCC tree.
+source:
+  - url: https://gcc.gnu.org/pub/gcc/releases/gcc-15.2.0/gcc-15.2.0.tar.xz
+    # sha256: <fill-in-after-download>
+    # compute locally:
+    # curl -L -o gcc-15.2.0.tar.xz https://gcc.gnu.org/pub/gcc/releases/gcc-15.2.0/gcc-15.2.0.tar.xz
+    # sha256sum gcc-15.2.0.tar.xz
+  # MPFR/GMP/MPC are required; either provide them in /usr/ports/sources or let porg download them:
+  - url: https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.2.tar.xz
+    # sha256: <fill-in>
+  - url: https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
+    # sha256: <fill-in>
+  - url: https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
+    # sha256: <fill-in>
+
+# Dependencies: binutils must be built first (pass1)
+dependencies:
+  build:
+    - binutils
+  runtime: []
+  optional: []
+
+build_dir: gcc-15.2.0
+destdir: build/gcc-15.2.0-dest
+
 rebuild_policy: if-newer
+
 graph:
   parent: toolchain
   children:
-    - glibc
     - binutils
-    - zlib
 
-source:
-  - url: https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
-    sha256: e4d0023ddea28b8f1b9e8c1db8c6f53649b841ef9ad8cfb1e7c8233e5bfe98f0
+hooks:
+  pre-build: []
+  post-build: []
+  pre-install: []
+  post-install: []
 
 build:
   prepare: |
-    mkdir -v build && cd build
+    tar -xf ../gcc-15.2.0.tar.xz
+    cd gcc-15.2.0
+    # Vendor required libraries into GCC source tree (LFS method)
+    tar -xf ../mpfr-4.2.2.tar.xz
+    mv -v mpfr-4.2.2 mpfr
+    tar -xf ../gmp-6.3.0.tar.xz
+    mv -v gmp-6.3.0 gmp
+    tar -xf ../mpc-1.3.1.tar.gz
+    mv -v mpc-1.3.1 mpc
+    mkdir -v build
+    cd build
   configure: |
-    ../configure --target=$(uname -m)-lfs-linux-gnu \
-      --prefix=/tools --disable-nls --enable-languages=c \
-      --without-headers
+    ../configure \
+      --target=$LFS_TGT \
+      --prefix=$LFS/tools \
+      --with-glibc-version=2.42 \
+      --with-sysroot=$LFS \
+      --with-newlib \
+      --without-headers \
+      --enable-default-pie \
+      --enable-default-ssp \
+      --disable-nls \
+      --disable-shared \
+      --disable-multilib \
+      --disable-threads \
+      --disable-libatomic \
+      --disable-libgomp \
+      --disable-libquadmath \
+      --disable-libssp \
+      --disable-libvtv \
+      --disable-libstdcxx \
+      --enable-languages=c,c++
   compile: |
-    make -j$(nproc)
+    make
   install: |
     make install
+    # Create full limits.h as LFS describes (run inside chroot /tools environment)
+    cd ..
+    cat gcc/limitx.h gcc/glimits.h gcc/limity.h > `dirname $($LFS_TGT-gcc -print-libgcc-file-name)`/include/limits.h
 
-# Flags opcionais (descomentadas manualmente se quiser otimização)
+# Optional flags (commented): choose either 'LFS default' or 'safer' by uncommenting.
+# LFS-optimized:
 # CFLAGS="-O2 -pipe -march=native"
+# Generic optimized:
 # CFLAGS="-O2 -pipe"
+# Safe (no arch-specific):
 # CFLAGS=""
+
+# Notes:
+# - This pass1 gcc is built for /tools and will be later replaced by a pass2 build.
+# - Ensure binutils-pass1 succeeded before building this package.
