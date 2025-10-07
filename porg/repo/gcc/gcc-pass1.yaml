@@ -1,0 +1,35 @@
+name: gcc
+version: 13.2.0
+stage: pass1
+category: base
+description: "GNU Compiler Collection (Pass 1)"
+chroot: true
+destdir: build/gcc-13.2.0-dest
+rebuild_policy: if-newer
+graph:
+  parent: toolchain
+  children:
+    - glibc
+    - binutils
+    - zlib
+
+source:
+  - url: https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+    sha256: e4d0023ddea28b8f1b9e8c1db8c6f53649b841ef9ad8cfb1e7c8233e5bfe98f0
+
+build:
+  prepare: |
+    mkdir -v build && cd build
+  configure: |
+    ../configure --target=$(uname -m)-lfs-linux-gnu \
+      --prefix=/tools --disable-nls --enable-languages=c \
+      --without-headers
+  compile: |
+    make -j$(nproc)
+  install: |
+    make install
+
+# Flags opcionais (descomentadas manualmente se quiser otimização)
+# CFLAGS="-O2 -pipe -march=native"
+# CFLAGS="-O2 -pipe"
+# CFLAGS=""
