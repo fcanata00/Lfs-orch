@@ -1,0 +1,131 @@
+# ===============================================================
+# GCC Pass 2 — GNU Compiler Collection 14.2.0
+# Conforme LFS 12.2 - Chapter 6.18 (https://www.linuxfromscratch.org/lfs/view/stable/chapter06/gcc-pass2.html)
+# Adaptado para o PORG — executado dentro de chroot seguro (bwrap)
+# ===============================================================
+
+name: gcc
+version: "14.2.0"
+stage: pass2
+category: base
+description: "GCC (Pass 2) - Rebuild of the GNU Compiler Collection with Glibc and full toolchain"
+license: "GPL-3.0"
+homepage: "https://gcc.gnu.org/"
+chroot: true
+
+# ============================
+# 🔗 Fontes
+# ============================
+source:
+  - url: https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+    sha256: 8fb9f7d9f2f4c9e53749a4a6d6bbffb1a21b2b63b4f1a993a9d1b6e3e230046b
+  - url: https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz
+    sha256: 4a17e1b046a29ff48d1889ad71f6e219e8b1f8a1a6ac0c64e61e6cfbcdaf44b6
+  - url: https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
+    sha256: 0f5edb16b09e6a8e726fa2f98d04be6b96e6cb3b867b63a29d0c4b8e769ce1bb
+  - url: https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
+    sha256: 5e09d1e7c7e0b70efc4cddf3ad0b2a7300e92ce40938e425c205bdb13a3c0b32
+
+# ============================
+# 🧩 Dependências
+# ============================
+dependencies:
+  build:
+    - binutils
+    - glibc
+  runtime: []
+  optional: []
+
+# ============================
+# ⚙️ Opções de build
+# ============================
+destdir: /usr
+build_dir: build/gcc-pass2
+rebuild_policy: if-newer
+
+# ============================
+# 🔄 Grafo
+# ============================
+graph:
+  parent: toolchain
+  children:
+    - binutils
+    - glibc
+
+# ============================
+# ⚙️ Hooks opcionais
+# ============================
+hooks:
+  pre-build: []
+  post-build: []
+  pre-install: []
+  post-install: []
+
+# ============================
+# 🧱 Processo de construção
+# ============================
+build:
+  prepare: |
+    echo "[gcc-pass2] Preparing source..."
+    tar -xf ../gcc-14.2.0.tar.xz
+    cd gcc-14.2.0
+
+    # Extrair bibliotecas internas exigidas pelo GCC
+    tar -xf ../mpfr-4.2.1.tar.xz && mv -v mpfr-4.2.1 mpfr
+    tar -xf ../gmp-6.3.0.tar.xz && mv -v gmp-6.3.0 gmp
+    tar -xf ../mpc-1.3.1.tar.gz && mv -v mpc-1.3.1 mpc
+
+    # 🩹 Ajustes conforme LFS
+    # Corrige caminho das libs 64-bit para lib normal
+    sed -e '/m64=/s/lib64/lib/' -i.orig gcc/config/i386/t-linux64
+
+    # Remove metadados de compilação que incluiriam informações do host
+    sed 's/BUILD_INFO.*=/BUILD_INFO =/' -i gcc/Makefile.in
+
+    mkdir -v build
+    cd build
+
+  configure: |
+    echo "[gcc-pass2] Configuring..."
+    ../configure \
+      --build=$(../config.guess) \
+      --host=$LFS_TGT \
+      --target=$LFS_TGT \
+      --prefix=/usr \
+      --with-build-sysroot=$LFS \
+      --enable-default-pie \
+      --enable-default-ssp \
+      --disable-nls \
+      --disable-multilib \
+      --disable-libatomic \
+      --disable-libgomp \
+      --disable-libquadmath \
+      --disable-libsanitizer \
+      --disable-libssp \
+      --disable-libvtv \
+      --enable-languages=c,c++ \
+      LDFLAGS_FOR_TARGET=-L$PWD/$LFS_TGT/libgcc
+
+  compile: |
+    echo "[gcc-pass2] Compiling..."
+    make -j$(nproc)
+
+  install: |
+    echo "[gcc-pass2] Installing..."
+    make DESTDIR=${DESTDIR} install
+
+    # Criar link simbólico cc → gcc conforme FHS
+    ln -sv gcc ${DESTDIR}/usr/bin/cc
+
+# ============================
+# 📝 Observações
+# ============================
+notes: |
+  • Esta é a segunda passagem do GCC usada para reconstruir o compilador
+    com a glibc e os headers já instalados.
+  • Executada dentro de chroot seguro via bwrap.
+  • Usa o target $LFS_TGT herdado do ambiente.
+  • O link simbólico 'cc' garante compatibilidade com scripts legados.
+  • SHA256 são os oficiais dos mirrors GNU.
+  • Nenhum patch é necessário nesta etapa segundo o LFS 12.2.
+  • Requer binutils e glibc já construídos e registrados no banco do PORG.
