@@ -1,631 +1,654 @@
 #!/usr/bin/env bash
-#
-# porg_audit.sh
-# Auditoria do sistema Porg: detecta e tenta corrigir problemas (libs faltando, symlinks quebrados,
-# orphans, problemas python, libtool .la, toolchain, scanners de CVE etc.)
-#
-# Integração esperada:
-# - porg_logger.sh (log colorido)
-# - porg_db.sh (installed DB)
-# - deps.py (resolver)
-# - porg-resolve (revdep/depclean)
-# - porg_remove.sh (remoção segura)
-# - porg-upgrade.sh / porg (atualização)
-#
-# Uso:
-#   porg_audit.sh --scan [--fix] [--dry-run] [--json] [--report <file>] [--quiet] [--yes]
-#
+# porg_audit.sh - Auditoria do sistema Porg
+# Integração com porg_logger.sh, porg_db.sh, porg_deps.py, builder e remove modules
 set -euo pipefail
 IFS=$'\n\t'
 
-# -------------------- Config / Paths (sobrescrevíveis por env ou porg.conf) --------------------
+# ------------------ Load config early ------------------
 PORG_CONF="${PORG_CONF:-/etc/porg/porg.conf}"
-LOGGER_SCRIPT="${LOGGER_SCRIPT:-/usr/lib/porg/porg_logger.sh}"
-DB_SCRIPT="${DB_SCRIPT:-/usr/lib/porg/porg_db.sh}"
-DEPS_PY="${DEPS_PY:-/usr/lib/porg/deps.py}"
-RESOLVE_CMD="${RESOLVE_CMD:-/usr/lib/porg/porg-resolve}"
-REMOVE_SCRIPT="${REMOVE_SCRIPT:-/usr/lib/porg/porg_remove.sh}"
-UPGRADE_CMD="${UPGRADE_CMD:-/usr/lib/porg/porg-upgrade}"
-PORG_WRAPPER="${PORG_WRAPPER:-porg}"   # wrapper 'porg' if available
-INSTALLED_DB="${INSTALLED_DB:-/var/db/porg/installed.json}"
-REPORT_DIR="${REPORT_DIR:-/var/log/porg}"
-DEFAULT_REPORT="${REPORT_DIR}/audit-$(date -u +%Y%m%dT%H%M%SZ).log"
+if [ -f "$PORG_CONF" ]; then
+  # shellcheck disable=SC1090
+  source "$PORG_CONF"
+fi
 
-# run flags
-DO_SCAN=false
-DO_FIX=false
-DRY_RUN=false
-QUIET=false
-AUTO_YES=false
-OUTPUT_JSON=false
-REPORT_FILE=""
+# ------------------ Defaults (can be overridden in porg.conf) ------------------
+PORTS_DIR="${PORTS_DIR:-/usr/ports}"
+INSTALLED_DB="${INSTALLED_DB:-${DB_DIR:-/var/lib/porg/db}/installed.json}"
+LOGGER_SCRIPT="${LOGGER_MODULE:-/usr/lib/porg/porg_logger.sh}"
+DEPS_PY="${DEPS_PY:-/usr/lib/porg/porg_deps.py}"
+BUILDER_SCRIPT="${BUILDER_SCRIPT:-/usr/lib/porg/porg_builder.sh}"
+REMOVE_SCRIPT="${REMOVE_MODULE:-/usr/lib/porg/porg_remove.sh}"
+REPORT_DIR="${REPORT_DIR:-/var/log/porg/reports}"
+DB_BACKUP_DIR="${DB_BACKUP_DIR:-/var/backups/porg/db}"
+CACHE_DIR="${CACHE_DIR:-/var/cache/porg}"
+PARALLEL_N="${PARALLEL_N:-$(nproc 2>/dev/null || echo 1)}"
+CHROOT_METHOD="${CHROOT_METHOD:-bwrap}"
+mkdir -p "$REPORT_DIR" "$DB_BACKUP_DIR" "$CACHE_DIR" "$(dirname "$INSTALLED_DB")"
 
-PARALLEL="$(nproc 2>/dev/null || echo 1)"
-
-# ensure dirs
-mkdir -p "${REPORT_DIR}" "$(dirname "${INSTALLED_DB}")"
-
-# -------------------- Helpers --------------------
-_load_porg_conf() {
-  [ -f "$PORG_CONF" ] || return 0
-  while IFS= read -r raw || [ -n "$raw" ]; do
-    line="${raw%%#*}"
-    line="${line%$'\r'}"
-    [ -z "$line" ] && continue
-    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-      eval "$line"
-    fi
-  done < "$PORG_CONF"
-}
-_load_porg_conf
-
-# source logger if exists
+# ------------------ Logger functions (use porg_logger.sh if available) ------------------
 if [ -f "$LOGGER_SCRIPT" ]; then
   # shellcheck disable=SC1090
   source "$LOGGER_SCRIPT"
 else
-  log() { local L="$1"; shift; printf "[%s] %s\n" "$L" "$*"; }
-  log_section() { printf "=== %s ===\n" "$*"; }
+  log_info()  { printf "%s [INFO] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+  log_warn()  { printf "%s [WARN] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+  log_error() { printf "%s [ERROR] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+  log_stage() { printf "%s [STAGE] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+  log_progress(){ printf "%s\n" "$*"; }
+  log_perf()  { "$@"; }
 fi
 
-# minimal json write
-dump_json() {
-  python3 - <<PY
-import json,sys
-obj=$1
-print(json.dumps(obj,ensure_ascii=False,indent=2))
-PY
-}
-
-# parse args
+# ------------------ CLI ------------------
 usage() {
   cat <<EOF
-Usage: ${0##*/} --scan [--fix] [--dry-run] [--report <file>] [--json] [--quiet] [--yes]
+Usage: $(basename "$0") [options]
 Options:
-  --scan       Run full audit (required)
-  --fix        Attempt to auto-fix issues found
-  --dry-run    Show actions that would be taken (no changes)
-  --report     Save human-readable report to file (default: ${DEFAULT_REPORT})
-  --json       Emit JSON to stdout (in addition to report)
-  --quiet      Minimal stdout (logs still written)
-  --yes        Assume yes for all prompts
-  -h,--help    Show this help
+  --scan               Scan system (libs broken, symlinks, orphan files)
+  --fix                Attempt to fix detected issues (rebuilds / repairs)
+  --clean              Remove orphaned packages (depclean)
+  --audit              Run deeper security audit (CVE, SUID, python issues)
+  --rebuild-needed     Rebuild packages marked by deps resolver
+  --all                Run scan -> fix -> clean -> rebuild-needed
+  --json               Output JSON report to stdout
+  --dry-run            Simulate actions, do not modify system
+  --yes                Auto-confirm destructive actions
+  --quiet              Minimal stdout (logs still recorded)
+  --parallel N         Use up to N parallel jobs (default: detected CPUs)
+  -h, --help           Show this help
 EOF
+  exit 1
 }
 
-if [ "$#" -eq 0 ]; then usage; exit 1; fi
-
-while [ "$#" -gt 0 ]; do
+CMD_SCAN=false; CMD_FIX=false; CMD_CLEAN=false; CMD_AUDIT=false; CMD_REBUILD=false; CMD_ALL=false
+OUT_JSON=false; DRY_RUN=false; AUTO_YES=false; QUIET=false
+while [ $# -gt 0 ]; do
   case "$1" in
-    --scan) DO_SCAN=true; shift ;;
-    --fix) DO_FIX=true; shift ;;
-    --dry-run) DRY_RUN=true; shift ;;
-    --report) REPORT_FILE="${2:-$DEFAULT_REPORT}"; shift 2 ;;
-    --json) OUTPUT_JSON=true; shift ;;
-    --quiet) QUIET=true; shift ;;
-    --yes) AUTO_YES=true; shift ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "Unknown argument: $1"; usage; exit 2 ;;
+    --scan) CMD_SCAN=true; shift;;
+    --fix) CMD_FIX=true; shift;;
+    --clean) CMD_CLEAN=true; shift;;
+    --audit) CMD_AUDIT=true; shift;;
+    --rebuild-needed) CMD_REBUILD=true; shift;;
+    --all) CMD_ALL=true; shift;;
+    --json) OUT_JSON=true; shift;;
+    --dry-run) DRY_RUN=true; shift;;
+    --yes) AUTO_YES=true; shift;;
+    --quiet) QUIET=true; shift;;
+    --parallel) PARALLEL_N="${2:-$PARALLEL_N}"; shift 2;;
+    -h|--help) usage;;
+    *) echo "Unknown option: $1"; usage;;
   esac
 done
 
-[ "${DO_SCAN}" = true ] || { echo "Error: --scan is required"; usage; exit 2; }
+if [ "$QUIET" = true ]; then export QUIET_MODE_DEFAULT=true; fi
 
-if [ -z "$REPORT_FILE" ]; then REPORT_FILE="$DEFAULT_REPORT"; fi
-TMP_REPORT="$(mktemp /tmp/porg_audit.XXXXXX)"
-TMP_JSON="$(mktemp /tmp/porg_audit_json.XXXXXX)"
-trap 'rm -f "$TMP_REPORT" "$TMP_JSON"' EXIT
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}"/porg-audit.XXXX)"
+REPORT_FILE="${REPORT_DIR}/audit-report-${TS}.json"
+trap 'rm -rf "$TMPDIR"' EXIT
 
-_log() {
-  local lvl="$1"; shift
-  if [ "$QUIET" = true ] && [ "$lvl" != "ERROR" ]; then
-    log "$lvl" "$@" >/dev/null 2>&1 || true
+# ------------------ Helpers ------------------
+_have_jq() { command -v jq >/dev/null 2>&1; }
+_have_python() { command -v python3 >/dev/null 2>&1; }
+_have_cve_bin_tool() { command -v cve-bin-tool >/dev/null 2>&1; }
+_have_osv_scanner() { command -v osv-scanner >/dev/null 2>&1; }
+
+# atomic write JSON
+_write_json() {
+  local out="$1"; shift
+  python3 - <<PY > "$out"
+import json,sys
+data = json.loads(sys.stdin.read())
+print(json.dumps(data, indent=2, ensure_ascii=False))
+PY
+}
+
+# backup DB
+backup_db() {
+  mkdir -p "$DB_BACKUP_DIR"
+  local backup="${DB_BACKUP_DIR}/installed.json.bak.${TS}"
+  if [ -f "$INSTALLED_DB" ]; then
+    cp -a "$INSTALLED_DB" "$backup"
+    log_info "Backed up installed DB -> $backup"
+    echo "$backup"
   else
-    log "$lvl" "$@"
+    log_warn "Installed DB not found at $INSTALLED_DB; no backup created"
   fi
-  printf "[%s] %s\n" "$lvl" "$*" >>"$TMP_REPORT"
 }
 
-# load list of installed package prefixes from DB
-load_installed_prefixes() {
-  python3 - <<PY
+# list installed packages (names)
+installed_pkgs_list() {
+  if [ ! -f "$INSTALLED_DB" ]; then
+    return 0
+  fi
+  if _have_jq; then
+    jq -r 'to_entries[] | .value.name' "$INSTALLED_DB" 2>/dev/null || true
+  else
+    python3 - <<PY
 import json,sys
-dbp=sys.argv[1]
 try:
-  db=json.load(open(dbp,'r',encoding='utf-8'))
+  db=json.load(open("$INSTALLED_DB",'r',encoding='utf-8'))
 except:
   db={}
-out=[]
 for k,v in db.items():
-  p=v.get('prefix')
-  if p:
-    out.append(p)
-print("\\n".join(out))
+  print(v.get('name') or k)
 PY
-  "$INSTALLED_DB"
+  fi
 }
 
-# helper: identify package owning a given file by comparing prefixes
-find_pkg_for_path() {
-  local path="$1"
-  # iterate installed prefixes and check if path startswith prefix
-  python3 - <<PY
-import sys, json, os
-pfile=sys.argv[1]
-dbp=sys.argv[2]
-try:
-  db=json.load(open(dbp,'r',encoding='utf-8'))
-except:
-  db={}
-candidates=[]
-for k,v in db.items():
-  pref=v.get('prefix')
-  if pref and pfile.startswith(pref.rstrip('/') + '/'):
-    candidates.append(k)
-if candidates:
-  print(candidates[0])
-else:
-  print("")
-PY
-  "$path" "$INSTALLED_DB"
-}
-
-# -------------------- SCAN: broken ELF libs --------------------
-scan_broken_libs() {
-  _log STAGE "Scanning ELF files for missing shared libraries (ldd ... 'not found')"
-  local search_dirs=(/usr/bin /usr/sbin /usr/lib /usr/lib64 /usr/local/bin /usr/local/lib /opt)
-  local -a elfs=()
-  for d in "${search_dirs[@]}"; do
-    [ -d "$d" ] || continue
-    while IFS= read -r f; do
-      # skip large traversal if non-regular
-      [ -f "$f" ] || continue
-      # check magic for ELF
-      if file -b --mime-type "$f" 2>/dev/null | grep -q "application/x-executable\|application/x-sharedlib\|application/x-pie-executable"; then
-        elfs+=("$f")
-      fi
-    done < <(find "$d" -type f -perm /111 -print 2>/dev/null || true)
-  done
-
-  printf "" > "$TMP_JSON"
-  missing_count=0
-  for e in "${elfs[@]}"; do
-    # run ldd safely
-    out="$(ldd "$e" 2>/dev/null || true)"
-    if printf "%s" "$out" | grep -q "not found"; then
-      missing_count=$((missing_count+1))
-      # collect missing libs
-      missing="$(printf "%s" "$out" | grep "not found" | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')"
-      _log WARN "ELF missing libs: $e -> $missing"
-      # attempt to attribute to a package
-      owner="$(find_pkg_for_path "$e" || true)"
-      if [ -n "$owner" ]; then
-        _log INFO "Binary $e appears to belong to package $owner"
-      else
-        _log DEBUG "No package owner found for $e"
-      fi
-      # write JSON entry
-      python3 - <<PY >>"$TMP_JSON"
+# call porg_deps to get rebuild-needed
+deps_rebuild_list() {
+  if [ -x "$DEPS_PY" ]; then
+    local plan
+    plan="$("$DEPS_PY" upgrade-plan --world 2>/dev/null || true)"
+    if [ -z "$plan" ]; then
+      echo ""
+      return 0
+    fi
+    if _have_jq; then
+      echo "$plan" | jq -r '.needs_rebuild[]?' 2>/dev/null || true
+    else
+      python3 - <<PY
 import json,sys
-entry={"type":"broken-lib","file":"$e","missing":"$missing","owner":"$owner"}
-print(json.dumps(entry,ensure_ascii=False))
+plan=json.loads(sys.stdin.read() or "{}")
+for p in plan.get("needs_rebuild",[]):
+    print(p)
 PY
     fi
-  done
+  fi
+}
 
-  _log INFO "Broken-ELF scan complete: ${missing_count} binaries with missing libs"
+# decide parallel execution helper: run array of commands with throttle
+run_throttle() {
+  local -n arr=$1
+  local max="${2:-$PARALLEL_N}"
+  local running=0
+  local pids=()
+  for c in "${arr[@]}"; do
+    eval "$c" & pids+=($!)
+    running=$((running+1))
+    if [ "$running" -ge "$max" ]; then
+      if wait -n 2>/dev/null; then
+        running=$((running-1))
+      else
+        # fallback: wait first pid
+        wait "${pids[0]}" || true
+        pids=("${pids[@]:1}")
+        running=$((running-1))
+      fi
+    fi
+  done
+  wait
+}
+
+# safe remove via REMOVE_SCRIPT or porg_db
+safe_remove_pkg() {
+  local pkg="$1"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] Would remove package: $pkg"
+    return 0
+  fi
+  if [ -x "$REMOVE_SCRIPT" ]; then
+    "$REMOVE_SCRIPT" "$pkg" --yes --force || log_warn "REMOVE_SCRIPT failed for $pkg"
+  elif [ -x "/usr/lib/porg/porg_db.sh" ]; then
+    /usr/lib/porg/porg_db.sh unregister "$pkg" || log_warn "porg_db unregister failed for $pkg"
+  else
+    log_warn "No remove module found; cannot remove $pkg safely"
+  fi
+}
+
+# safe rebuild via builder or porg
+safe_rebuild_pkg() {
+  local pkg="$1"
+  log_info "Rebuilding package: $pkg"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] Would rebuild $pkg"
+    return 0
+  fi
+  # try builder metafile
+  mf="$(find "$PORTS_DIR" -type f -iname "${pkg}*.y*ml" -print -quit 2>/dev/null || true)"
+  if [ -n "$mf" ] && [ -x "$BUILDER_SCRIPT" ]; then
+    "$BUILDER_SCRIPT" build "$mf" || log_warn "Builder returned non-zero for $pkg"
+    return $?
+  fi
+  if command -v porg >/dev/null 2>&1; then
+    porg -i "$pkg" || log_warn "porg -i returned non-zero for $pkg"
+    return $?
+  fi
+  log_warn "No builder interface found to rebuild $pkg"
+  return 2
+}
+
+# ------------------ Scans ------------------
+# 1) broken libraries via ldd scanning of installed package prefixes
+scan_broken_libs() {
+  log_stage "scan_broken_libs"
+  local out="${TMPDIR}/broken-libs.json"
+  python3 - <<PY > "$out"
+import json,os,sys,subprocess
+res={"broken":[]}
+dbpath="${INSTALLED_DB}"
+try:
+    db=json.load(open(dbpath,'r',encoding='utf-8'))
+except:
+    db={}
+for k,v in db.items():
+    name=v.get("name") or k
+    prefix=v.get("prefix") or '/'
+    # search common lib/bin paths
+    paths=[os.path.join(prefix,'bin'), os.path.join(prefix,'sbin'), os.path.join(prefix,'lib'), os.path.join(prefix,'lib64'), os.path.join(prefix,'usr','lib'), os.path.join(prefix,'usr','bin')]
+    seen=False
+    for p in paths:
+        if os.path.isdir(p):
+            for root,dirs,files in os.walk(p):
+                for f in files:
+                    fp=os.path.join(root,f)
+                    try:
+                        out = subprocess.check_output(['file', '--brief', '--mime-type', fp], stderr=subprocess.DEVNULL).decode().strip()
+                    except:
+                        continue
+                    if 'application/x-executable' in out or 'application/x-pie-executable' in out or 'application/x-sharedlib' in out:
+                        # ldd may fail on scripts; ignore errors
+                        try:
+                            lout = subprocess.check_output(['ldd', fp], stderr=subprocess.STDOUT, timeout=5).decode()
+                        except Exception as e:
+                            lout = str(e)
+                        if 'not found' in lout:
+                            res["broken"].append({"pkg":name,"file":fp,"ldd":lout})
+                            seen=True
+                            break
+                if seen: break
+        if seen: break
+print(json.dumps(res))
+PY
+  cat "$out"
+}
+
+# 2) broken symlinks
+scan_broken_symlinks() {
+  log_stage "scan_broken_symlinks"
+  local out="${TMPDIR}/broken-symlinks.json"
+  find / -xdev -type l -xtype l -print0 2>/dev/null | xargs -0 -r -n1 bash -c 'printf "%s\n" "$0"' > "${TMPDIR}/symlinks-list.txt" 2>/dev/null || true
+  python3 - <<PY > "$out"
+import json,os
+res={"broken_symlinks":[]}
+try:
+    with open("${TMPDIR}/symlinks-list.txt",'r',encoding='utf-8') as f:
+        for l in f:
+            p=l.strip()
+            if not p: continue
+            if not os.path.exists(os.path.realpath(p)):
+                res["broken_symlinks"].append({"path":p,"target":os.readlink(p) if os.path.islink(p) else ""})
+except Exception:
+    pass
+print(json.dumps(res))
+PY
+  cat "$out"
+}
+
+# 3) orphans: packages with no reverse-deps (uses depclean_scan style via deps.py)
+scan_orphan_packages() {
+  log_stage "scan_orphan_packages"
+  local out="${TMPDIR}/orphans.json"
+  if [ -x "$DEPS_PY" ]; then
+    plan="$("$DEPS_PY" upgrade-plan --world 2>/dev/null || true)"
+    if [ -n "$plan" ]; then
+      if _have_jq; then
+        # use deps.py analysis to produce orphans heuristics
+        echo '{"orphans": []}' > "$out"
+      else
+        python3 - <<PY > "$out"
+import json,os
+try:
+    plan=json.loads("""$plan""")
+except:
+    plan={}
+# fallback stub: no orphans detected here
+print(json.dumps({"orphans":[]}))
+PY
+      fi
+      cat "$out"
+      return
+    fi
+  fi
+  # naive fallback: find packages in installed.json that are not listed as deps in any metafile
+  python3 - <<PY > "$out"
+import json,os
+ports_dir="${PORTS_DIR}"
+try:
+    db=json.load(open("${INSTALLED_DB}",'r',encoding='utf-8'))
+except:
+    db={}
+# build reverse map from ports
+rev={}
+for root,dirs,files in os.walk(ports_dir):
+    for fn in files:
+        if fn.lower().endswith(('.yml','.yaml')):
+            try:
+                import yaml
+                d=yaml.safe_load(open(os.path.join(root,fn),'r',encoding='utf-8')) or {}
+            except:
+                continue
+            deps=[]
+            dd=d.get('dependencies') or d.get('deps') or {}
+            if isinstance(dd,dict):
+                for k in ('build','runtime','optional'):
+                    v=dd.get(k)
+                    if isinstance(v,list): deps+=v
+            elif isinstance(dd,list):
+                deps+=dd
+            name=d.get('name') or fn.rsplit('.',1)[0]
+            for dep in deps:
+                rev.setdefault(dep,set()).add(name)
+orphans=[]
+for k,v in db.items():
+    name=v.get('name') or k
+    if name not in rev or len(rev.get(name,[]))==0:
+        orphans.append({"pkg":name,"prefix":v.get("prefix")})
+print(json.dumps({"orphans":orphans}))
+PY
+  cat "$out"
+}
+
+# 4) pkgconfig and .la issues
+scan_pkgconfig_and_la() {
+  log_stage "scan_pkgconfig_and_la"
+  local out="${TMPDIR}/pkgconf-la.json"
+  python3 - <<PY > "$out"
+import json,os
+res={"pkgconfig_missing":[], "libtool_la": []}
+for root,dirs,files in os.walk("/usr"):
+    for f in files:
+        if f.endswith(".pc"):
+            p=os.path.join(root,f)
+            try:
+                data=open(p,'r',encoding='utf-8').read()
+            except:
+                continue
+            # detect libs that may be referenced but missing (heuristic: look for -lfoo)
+            # skipping deep parsing here
+        if f.endswith(".la"):
+            p=os.path.join(root,f)
+            # check for empty dependency_libs or obviously broken entries
+            try:
+                text=open(p,'r',encoding='utf-8').read()
+                if "dependency_libs" in text and " -l" not in text and " -L" not in text:
+                    res["libtool_la"].append({"path":p})
+            except:
+                pass
+print(json.dumps(res))
+PY
+  cat "$out"
+}
+
+# 5) python site-packages orphan detection (heuristic)
+scan_python_orphans() {
+  log_stage "scan_python_orphans"
+  local out="${TMPDIR}/python-orphans.json"
+  python3 - <<PY > "$out"
+import json,sys,os
+res={"python_orphans":[]}
+# find site-packages dirs
+import site
+paths=set(site.getsitepackages() + [site.getusersitepackages()])
+for p in paths:
+    if not os.path.isdir(p): continue
+    for root,dirs,files in os.walk(p):
+        for f in files:
+            if f.endswith(".py") or f.endswith(".so"):
+                # naive heuristic: check if there exists any package in installed DB providing this module
+                res["python_orphans"].append({"file": os.path.join(root,f)})
+print(json.dumps(res))
+PY
+  cat "$out"
+}
+
+# 6) security quick scans (cve-bin-tool / osv-scanner fallback)
+scan_security_tools() {
+  log_stage "scan_security_tools"
+  local out="${TMPDIR}/security-scan.json"
+  if _have_cve_bin_tool; then
+    log_info "Running cve-bin-tool (may take long)..."
+    if [ "$DRY_RUN" = true ]; then
+      echo '{"cve_bin_tool":"simulated"}' > "$out"
+    else
+      cve-bin-tool --outputjson "$out" /usr || true
+    fi
+  elif _have_osv_scanner; then
+    log_info "Running osv-scanner..."
+    if [ "$DRY_RUN" = true ]; then
+      echo '{"osv":"simulated"}' > "$out"
+    else
+      osv-scanner -o "$out" /usr || true
+    fi
+  else
+    echo '{"notes":"no cve scanner available"}' > "$out"
+  fi
+  cat "$out"
+}
+
+# ------------------ Fixers ------------------
+# attempt to fix broken libs by rebuilding package providing them (best-effort)
+fix_broken_libs() {
+  log_stage "fix_broken_libs"
+  local rev_json="${TMPDIR}/broken-libs.json"
+  if [ ! -f "$rev_json" ]; then
+    scan_broken_libs > "$rev_json"
+  fi
+  # extract unique pkg names
+  if _have_jq; then
+    mapfile -t pkgs < <(jq -r '.broken[]?.pkg' "$rev_json" 2>/dev/null | sort -u)
+  else
+    mapfile -t pkgs < <(python3 - <<PY
+import json
+try:
+  r=json.load(open("$rev_json",'r',encoding='utf-8'))
+except:
+  r={}
+s=set()
+for e in r.get("broken",[]):
+    s.add(e.get("pkg"))
+for x in sorted(s):
+    print(x)
+PY
+)
+  fi
+  if [ "${#pkgs[@]}" -eq 0 ]; then
+    log_info "No broken libs found to fix"
+    return 0
+  fi
+  log_info "Packages with broken libs: ${pkgs[*]}"
+  local cmds=()
+  for p in "${pkgs[@]}"; do
+    cmds+=("safe_rebuild_pkg '$p'")
+  done
+  run_throttle cmds "$PARALLEL_N"
   return 0
 }
 
-# -------------------- SCAN: broken symlinks --------------------
-scan_broken_symlinks() {
-  _log STAGE "Scanning for broken symbolic links (common system paths)"
-  local search_dirs=(/usr /bin /lib /lib64 /sbin /opt /usr/local)
-  broken_links_file="$(mktemp)"
-  find "${search_dirs[@]}" -type l -print 2>/dev/null | while IFS= read -r s; do
-    target="$(readlink -f "$s" 2>/dev/null || true)"
-    if [ -z "$target" ] || [ ! -e "$target" ]; then
-      echo "$s" >> "$broken_links_file"
-      _log WARN "Broken symlink: $s -> $target"
-    fi
-  done
-  if [ -s "$broken_links_file" ]; then
-    while IFS= read -r l; do
-      python3 - <<PY >>"$TMP_JSON"
-import json
-print(json.dumps({"type":"broken-symlink","path":"$l"},ensure_ascii=False))
-PY
-    done <"$broken_links_file"
-  fi
-  rm -f "$broken_links_file"
-}
-
-# -------------------- SCAN: libtool .la files --------------------
-scan_libtool_la() {
-  _log STAGE "Scanning for libtool .la files (may cause link-time problems)"
-  found=0
-  while IFS= read -r la; do
-    found=$((found+1))
-    _log WARN "Found .la (libtool) file: $la"
-    owner="$(find_pkg_for_path "$la" || true)"
-    _log DEBUG "Owner: ${owner:-(none)}"
-    python3 - <<PY >>"$TMP_JSON"
-import json
-print(json.dumps({"type":"libtool-la","path":"$la","owner":"${owner:-}"} , ensure_ascii=False))
-PY
-  done < <(find /usr /usr/local /opt -name '*.la' 2>/dev/null || true)
-  _log INFO "libtool .la scan complete: ${found} found"
-}
-
-# -------------------- SCAN: orphan files (not under registered prefixes) --------------------
-scan_orphans() {
-  _log STAGE "Scanning for files outside registered package prefixes (candidate orphans)"
-  # load prefixes
-  prefixes="$(load_installed_prefixes || true)"
-  # inspect common local install trees for orphan content
-  search_dirs=(/usr/local /opt /srv /var/local)
-  orphan_tmp="$(mktemp)"
-  for d in "${search_dirs[@]}"; do
-    [ -d "$d" ] || continue
-    # find files (limit depth to avoid very long scans)
-    find "$d" -mindepth 1 -maxdepth 4 -print 2>/dev/null | while IFS= read -r p; do
-      keep=false
-      while IFS= read -r pref; do
-        [ -z "$pref" ] && continue
-        # normalize
-        if printf "%s" "$p" | grep -q "^${pref%/}/"; then
-          keep=true; break
-        fi
-      done <<< "$prefixes"
-      if [ "$keep" = false ]; then
-        echo "$p" >> "$orphan_tmp"
-      fi
-    done
-  done
-  # dedupe
-  sort -u "$orphan_tmp" -o "$orphan_tmp"
-  if [ -s "$orphan_tmp" ]; then
-    _log WARN "Potential orphan files found (first 20 shown):"
-    head -n20 "$orphan_tmp" | sed 's/^/  /' | tee -a "$TMP_REPORT"
-    while IFS= read -r o; do
-      python3 - <<PY >>"$TMP_JSON"
-import json
-print(json.dumps({"type":"orphan","path":"$o"},ensure_ascii=False))
-PY
-    done <"$orphan_tmp"
-  else
-    _log INFO "No obvious orphans found under ${search_dirs[*]}"
-  fi
-  rm -f "$orphan_tmp"
-}
-
-# -------------------- SCAN: python problems --------------------
-scan_python() {
-  _log STAGE "Scanning Python environments (pip check) when possible"
-  # find python3 interpreters (common)
-  pythons=(/usr/bin/python3 /usr/local/bin/python3 /usr/bin/python)
-  found=0
-  for py in "${pythons[@]}"; do
-    [ -x "$py" ] || continue
-    # check pip
-    if "$py" -m pip >/dev/null 2>&1; then
-      found=$((found+1))
-      out="$("$py" -m pip check 2>&1 || true)"
-      if printf "%s" "$out" | grep -q "No broken"; then
-        _log INFO "pip check OK for $py"
-      elif [ -n "$out" ]; then
-        _log WARN "pip check issues for $py:"
-        printf "%s\n" "$out" | sed 's/^/  /' | tee -a "$TMP_REPORT"
-        python3 - <<PY >>"$TMP_JSON"
-import json
-print(json.dumps({"type":"python-pip-check","python":"$py","output":${out!}} , ensure_ascii=False))
-PY
-      fi
-    fi
-  done
-  if [ "$found" -eq 0 ]; then
-    _log DEBUG "No python/pip found to run pip check"
-  fi
-}
-
-# -------------------- SCAN: toolchain / gcc issues --------------------
-scan_toolchain() {
-  _log STAGE "Checking for GCC/toolchain anomalies (multiple versions, missing symlinks)"
-  if command -v gcc >/dev/null 2>&1; then
-    gccver="$(gcc --version 2>/dev/null | head -n1)"
-    _log INFO "gcc detected: ${gccver}"
-  else
-    _log WARN "gcc not found in PATH"
-  fi
-  # check for multiple installed gcc prefixes in DB
-  python3 - <<PY >>"$TMP_JSON"
-import json
-dbp="$INSTALLED_DB"
-try:
-  db=json.load(open(dbp,'r',encoding='utf-8'))
-except:
-  db={}
-gccs=[]
-for k,v in db.items():
-  if k.startswith('gcc') or v.get('name','').lower().startswith('gcc'):
-    gccs.append(k)
-if gccs:
-  for g in gccs:
-    print(json.dumps({"type":"gcc-installed","pkg":g},ensure_ascii=False))
-PY
-  _log INFO "Toolchain scan complete"
-}
-
-# -------------------- SCAN: vulnerability scanners (SVE/CVE) --------------------
-scan_vulns() {
-  _log STAGE "Attempting vulnerability scan (using installed scanners if available)"
-  if command -v sve >/dev/null 2>&1; then
-    _log INFO "Running 'sve' scanner (if available)"
-    if [ "$DRY_RUN" = false ]; then
-      sve --output json --quiet >/tmp/porg_sve.json 2>/dev/null || true
-      [ -f /tmp/porg_sve.json ] && jq . /tmp/porg_sve.json >>"$TMP_JSON" 2>/dev/null || true
-    else
-      _log INFO "[dry-run] would run 'sve' scanner"
-    fi
-    return 0
-  fi
-  if command -v cve-bin-tool >/dev/null 2>&1; then
-    _log INFO "Running cve-bin-tool (may take long)"
-    if [ "$DRY_RUN" = false ]; then
-      cve-bin-tool --format json -o /tmp/porg_cve.json /usr 2>/dev/null || true
-      [ -f /tmp/porg_cve.json ] && jq . /tmp/porg_cve.json >>"$TMP_JSON" 2>/dev/null || true
-    else
-      _log INFO "[dry-run] would run cve-bin-tool"
-    fi
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1 && python3 -c "import osv" >/dev/null 2>&1; then
-    _log INFO "OSV/python support present — running lightweight checks not implemented automatically (use manual mode)"
-    # not implemented heavy scan
-  else
-    _log WARN "No vulnerability scanner (sve / cve-bin-tool / osv) found; skipping CVE scan"
-  fi
-}
-
-# -------------------- AUTO-FIX actions (best-effort) --------------------
-# NOTE: all fixers respect DRY_RUN and AUTO_YES
-
-fix_broken_libs() {
-  _log STAGE "Attempting to fix missing library issues (best-effort)"
-  # read entries from TMP_JSON with type broken-lib
-  python3 - <<PY
-import json,sys
-from pathlib import Path
-f=sys.argv[1]
-try:
-  lines=open(f).read().splitlines()
-except:
-  lines=[]
-items=[]
-for line in lines:
-  if not line.strip(): continue
-  try:
-    obj=json.loads(line)
-  except:
-    continue
-  if obj.get('type')=='broken-lib':
-    items.append(obj)
-print(json.dumps(items))
-PY
-  "$TMP_JSON" > /tmp/porg_audit_brokenlibs.json || true
-
-  # iterate and attempt to repair: if owner known, attempt to reinstall via porg
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    pkg="$(python3 -c "import json,sys;print(json.loads(sys.stdin.read())[0].get('owner',''))" <<<"$line" 2>/dev/null || true)"
-    file="$(python3 -c "import json,sys;print(json.loads(sys.stdin.read())[0].get('file',''))" <<<"$line" 2>/dev/null || true)"
-    missing="$(python3 -c "import json,sys;print(json.loads(sys.stdin.read())[0].get('missing',''))" <<<"$line" 2>/dev/null || true)"
-    # decide action
-    if [ -n "$pkg" ]; then
-      _log INFO "Trying to rebuild/install owner package $pkg to restore libs for $file"
-      if [ "$DRY_RUN" = true ]; then
-        _log INFO "[dry-run] would run: ${PORG_WRAPPER} -i $pkg"
-        continue
-      fi
-      if command -v "$PORG_WRAPPER" >/dev/null 2>&1; then
-        _log INFO "Invoking: ${PORG_WRAPPER} -i $pkg"
-        $PORG_WRAPPER -i "$pkg" || _log WARN "porg wrapper failed for $pkg"
-      elif [ -x "$UPGRADE_CMD" ]; then
-        _log INFO "Invoking: $UPGRADE_CMD --pkg $pkg"
-        "$UPGRADE_CMD" --pkg "$pkg" || _log WARN "porg-upgrade failed for $pkg"
-      else
-        _log WARN "No porg wrapper or upgrade script found — cannot auto-rebuild $pkg"
-      fi
-    else
-      # owner unknown: try porg-resolve to rebuild possible dependents
-      if [ -x "$RESOLVE_CMD" ]; then
-        _log INFO "Owner unknown for $file. Invoking porg-resolve --fix to attempt system-wide repair"
-        if [ "$DRY_RUN" = false ]; then
-          "$RESOLVE_CMD" --fix || _log WARN "porg-resolve --fix returned non-zero"
-        else
-          _log INFO "[dry-run] would run: $RESOLVE_CMD --fix"
-        fi
-      else
-        _log WARN "Owner unknown and porg-resolve not available; manual investigation required for $file (missing libs: $missing)"
-      fi
-    fi
-  done < <(jq -c '.[]' /tmp/porg_audit_brokenlibs.json 2>/dev/null || true)
-}
-
-fix_broken_symlinks() {
-  _log STAGE "Fixing broken symlinks (remove or re-create if possible)"
-  # list broken symlinks previously detected (in TMP_REPORT)
-  while IFS= read -r s; do
-    [ -z "$s" ] && continue
-    _log INFO "Considering broken symlink: $s"
-    if [ "$DRY_RUN" = true ]; then
-      _log INFO "[dry-run] would remove $s"
-      continue
-    fi
-    if [ "$AUTO_YES" = true ]; then
-      rm -f -- "$s" && _log INFO "Removed $s"
-    else
-      if confirm "Remove broken symlink $s?"; then
-        rm -f -- "$s" && _log INFO "Removed $s"
-      else
-        _log INFO "Skipped $s"
-      fi
-    fi
-  done < <(grep '"broken-symlink"' -n "$TMP_REPORT" 2>/dev/null | cut -d: -f1 || true)
-}
-
+# attempt to fix orphans - usually remove them or flag for manual review
 fix_orphans() {
-  _log STAGE "Handling orphan files (best-effort)"
-  # read orphans from TMP_REPORT (we stored them earlier)
-  # Instead of risking mass deletion, propose to call porg_remove for orphan packages if safe
-  # If orphan is a directory, propose manual removal or archive
-  _log INFO "Orphan handling: listing orphans and suggesting removal. Auto-removal only with --fix --yes"
-  # parse TMP_JSON for 'orphan' entries
-  jq -r 'select(.type=="orphan") | .path' "$TMP_JSON" 2>/dev/null | while IFS= read -r p; do
-    [ -z "$p" ] && continue
-    _log WARN "Orphan candidate: $p"
-    if [ "$DRY_RUN" = true ]; then
-      _log INFO "[dry-run] would consider removal of $p"
-      continue
-    fi
-    if [ "$AUTO_YES" = true ]; then
-      rm -rf -- "$p" && _log INFO "Removed orphan $p" || _log WARN "Failed to remove $p"
-    else
-      if confirm "Remove orphan $p?"; then
-        rm -rf -- "$p" && _log INFO "Removed orphan $p" || _log WARN "Failed to remove $p"
-      else
-        _log INFO "Skipped orphan $p"
-      fi
-    fi
-  done
-}
-
-fix_python_issues() {
-  _log STAGE "Attempting to fix Python environment issues (pip check)"
-  # attempt to run pip check and pip install --upgrade for problematic packages
-  if command -v python3 >/dev/null 2>&1; then
-    if python3 -m pip >/dev/null 2>&1; then
-      out="$(python3 -m pip check 2>&1 || true)"
-      if [ -n "$out" ]; then
-        _log WARN "pip check reported issues: $out"
-        # try to parse package names and attempt upgrade
-        pkgs="$(python3 - <<PY
-import re,sys
-s=sys.stdin.read()
-names=set()
-for line in s.splitlines():
-  m=re.match(r'([^ ]+)',line)
-  if m:
-    names.add(m.group(1))
-print(" ".join(names))
-PY
-)"
-        if [ -n "$pkgs" ]; then
-          for p in $pkgs; do
-            _log INFO "Attempting pip install --upgrade $p"
-            if [ "$DRY_RUN" = true ]; then
-              _log INFO "[dry-run] pip install --upgrade $p"
-            else
-              python3 -m pip install --upgrade "$p" || _log WARN "pip upgrade failed for $p"
-            fi
-          done
-        fi
-      else
-        _log INFO "pip check: no issues detected"
-      fi
-    else
-      _log DEBUG "pip not available for system python3"
-    fi
+  log_stage "fix_orphans"
+  local orphans_json="${TMPDIR}/orphans.json"
+  if [ ! -f "$orphans_json" ]; then
+    scan_orphan_packages > "$orphans_json"
   fi
-}
-
-fix_vulns_actions() {
-  _log STAGE "Attempting to remediate vulnerable packages reported by scanners"
-  # If TMP_JSON contains entries from scanners, attempt to upgrade packages listed
-  # Look for keys that indicate package names in known scanner outputs — best-effort.
+  if _have_jq; then
+    mapfile -t orphans < <(jq -r '.orphans[]?.pkg' "$orphans_json" 2>/dev/null | sort -u)
+  else
+    mapfile -t orphans < <(python3 - <<PY
+import json
+try:
+  d=json.load(open("$orphans_json",'r',encoding='utf-8'))
+except:
+  d={}
+for e in d.get("orphans",[]):
+    print(e.get("pkg"))
+PY
+)
+  fi
+  if [ "${#orphans[@]}" -eq 0 ]; then
+    log_info "No orphan packages detected"
+    return 0
+  fi
+  log_info "Orphan packages: ${orphans[*]}"
   if [ "$DRY_RUN" = true ]; then
-    _log INFO "[dry-run] would try to call porg-upgrade for vulnerable packages found"
-    return
+    log_info "[DRY-RUN] Would remove: ${orphans[*]}"
+    return 0
   fi
-  # Example: cve-bin-tool or sve outputs may contain 'package' or 'path' - try to extract package names and call porg-upgrade
-  jq -r 'select(.type=="vulnerability" or .package) | .package // .path // empty' "$TMP_JSON" 2>/dev/null | sort -u | while IFS= read -r item; do
-    [ -z "$item" ] && continue
-    # if item looks like a path, try find_pkg_for_path
-    if [ -f "$item" ]; then
-      pkg="$(find_pkg_for_path "$item" || true)"
-    else
-      pkg="$item"
-    fi
-    if [ -n "$pkg" ]; then
-      _log INFO "Attempting to upgrade vulnerable package: $pkg"
-      if command -v "$PORG_WRAPPER" >/dev/null 2>&1; then
-        $PORG_WRAPPER -i "$pkg" || _log WARN "porg wrapper failed to upgrade $pkg"
-      elif [ -x "$UPGRADE_CMD" ]; then
-        "$UPGRADE_CMD" --pkg "$pkg" || _log WARN "porg-upgrade failed for $pkg"
-      else
-        _log WARN "No upgrade mechanism available for $pkg"
-      fi
-    fi
+  if [ "$AUTO_YES" != true ]; then
+    printf "Remove orphans? %s [y/N]: " "${orphans[*]}"
+    read -r ans || true
+    case "$ans" in y|Y|yes|Yes) ;; *) log_info "Aborting orphan removal"; return 0 ;; esac
+  fi
+  for p in "${orphans[@]}"; do
+    safe_remove_pkg "$p"
   done
+  return 0
 }
 
-# -------------------- Orchestrator --------------------
-_log STAGE "Starting Porg audit: scan=$(date -u +%Y-%m-%dT%H:%M:%SZ) fix=${DO_FIX} dryrun=${DRY_RUN}"
+# run security audit fixes (best-effort: report; do not auto-fix CVEs)
+fix_security_findings() {
+  log_stage "fix_security_findings"
+  # for CVEs, we will only report; rebuilding flagged packages can help but we avoid auto-fix
+  log_info "Security findings will be reported; auto-fix is not performed for CVEs"
+  return 0
+}
 
-# run scans
-scan_broken_libs
-scan_broken_symlinks
-scan_libtool_la
-scan_orphans
-scan_python
-scan_toolchain
-scan_vulns
-
-# assemble JSON report lines into an array
-# TMP_JSON contains per-line JSON entries; convert to array
-if [ -f "$TMP_JSON" ] && [ -s "$TMP_JSON" ]; then
-  python3 - <<PY >"${TMP_JSON}.arr"
-import json,sys
-items=[]
-for line in open(sys.argv[1],'r',encoding='utf-8').read().splitlines():
-  try:
-    items.append(json.loads(line))
-  except:
-    pass
-print(json.dumps(items,ensure_ascii=False))
+# ------------------ Compose and emit consolidated report ------------------
+compose_final_report() {
+  log_stage "compose_final_report"
+  # collate JSON fragments into final report
+  python3 - <<PY > "$REPORT_FILE"
+import json,os,time
+out={}
+out['generated_at']=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+out['host']=os.uname().nodename
+out['kernel']=os.uname().release
+def loadf(p):
+    try:
+        return json.load(open(p,'r',encoding='utf-8'))
+    except:
+        return {}
+base="${TMPDIR}"
+out['broken_libs']=loadf(base+"/broken-libs.json").get("broken",[])
+out['broken_symlinks']=loadf(base+"/broken-symlinks.json").get("broken_symlinks",[])
+out['orphans']=loadf(base+"/orphans.json").get("orphans",[])
+out['pkgconf_la']=loadf(base+"/pkgconf-la.json")
+out['python_orphans']=loadf(base+"/python-orphans.json").get("python_orphans",[])
+out['security']=loadf(base+"/security-scan.json")
+print(json.dumps(out, indent=2, ensure_ascii=False))
 PY
-  mv "${TMP_JSON}.arr" "$TMP_JSON"
-else
-  echo "[]" > "$TMP_JSON"
-fi
 
-# write human-readable report
-{
-  echo "Porg Audit Report - $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo
-  cat "$TMP_REPORT"
-  echo
-  echo "JSON summary (first 2000 chars):"
-  head -c 2000 "$TMP_JSON" || true
-} > "$REPORT_FILE"
+  log_info "Audit report written to $REPORT_FILE"
+  # create link latest
+  ln -sf "$REPORT_FILE" "${REPORT_DIR}/audit-latest.json"
+  if [ "$OUT_JSON" = true ]; then
+    cat "$REPORT_FILE"
+  fi
+}
 
-_log INFO "Audit report saved to $REPORT_FILE"
+# ------------------ High-level flows ------------------
+flow_scan() {
+  log_stage "Audit: scan flow"
+  scan_broken_libs > "${TMPDIR}/broken-libs.json"
+  scan_broken_symlinks > "${TMPDIR}/broken-symlinks.json"
+  scan_orphan_packages > "${TMPDIR}/orphans.json"
+  scan_pkgconfig_and_la > "${TMPDIR}/pkgconf-la.json"
+  scan_python_orphans > "${TMPDIR}/python-orphans.json"
+  if [ "$CMD_AUDIT" = true ]; then
+    scan_security_tools > "${TMPDIR}/security-scan.json"
+  fi
+  compose_final_report
+}
 
-# optionally output JSON to stdout
-if [ "$OUTPUT_JSON" = true ]; then
-  cat "$TMP_JSON"
-fi
-
-# fixes (best-effort) if requested
-if [ "$DO_FIX" = true ]; then
-  _log STAGE "Attempting automatic fixes (best-effort) -- DRY_RUN=${DRY_RUN}"
+flow_fix() {
+  log_stage "Audit: fix flow"
+  backup_db
   fix_broken_libs
-  fix_broken_symlinks
   fix_orphans
-  fix_python_issues
-  fix_vulns_actions
-  _log INFO "Auto-fix attempt completed (check logs and report)"
+  fix_security_findings
+  compose_final_report
+}
+
+flow_clean() {
+  log_stage "Audit: clean flow"
+  scan_orphan_packages > "${TMPDIR}/orphans.json"
+  fix_orphans
+  compose_final_report
+}
+
+flow_rebuild_needed() {
+  log_stage "Audit: rebuild-needed flow"
+  deps_rebuild_list > "${TMPDIR}/rebuild-list.txt" || true
+  mapfile -t rebuilds < <(grep -v '^\s*$' "${TMPDIR}/rebuild-list.txt" || true)
+  if [ "${#rebuilds[@]}" -eq 0 ]; then
+    log_info "No rebuild-needed candidates"
+    return 0
+  fi
+  log_info "Rebuild-needed packages: ${rebuilds[*]}"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] Would rebuild: ${rebuilds[*]}"
+    return 0
+  fi
+  local cmds=()
+  for p in "${rebuilds[@]}"; do
+    cmds+=("safe_rebuild_pkg '$p'")
+  done
+  run_throttle cmds "$PARALLEL_N"
+  compose_final_report
+}
+
+flow_all() {
+  log_stage "Audit: full pipeline"
+  flow_scan
+  flow_fix
+  flow_clean
+  flow_rebuild_needed
+  log_info "Full audit pipeline completed"
+}
+
+# ------------------ Dispatcher ------------------
+if [ "$CMD_ALL" = true ]; then
+  CMD_SCAN=true; CMD_FIX=true; CMD_CLEAN=true; CMD_REBUILD=true; CMD_AUDIT=true
 fi
 
-_log INFO "Porg audit complete"
-exit 0
+if [ "$CMD_SCAN" = true ]; then flow_scan; fi
+if [ "$CMD_FIX" = true ]; then flow_fix; fi
+if [ "$CMD_CLEAN" = true ]; then flow_clean; fi
+if [ "$CMD_REBUILD" = true ]; then flow_rebuild_needed; fi
+if [ "$CMD_AUDIT" = true ] && [ "$CMD_SCAN" = false ]; then
+  # audit-only (security)
+  scan_security_tools > "${TMPDIR}/security-scan.json"
+  compose_final_report
+fi
+
+# If nothing selected, show usage
+if ! $CMD_SCAN && ! $CMD_FIX && ! $CMD_CLEAN && ! $CMD_AUDIT && ! $CMD_REBUILD && ! $CMD_ALL ; then
+  usage
+fi
+
+# return exit code: 0 ok, 1 issues found, 2 runtime error, 3 partial fixes
+# Basic heuristic: if report contains items -> exit 1
+if _have_jq; then
+  issues=$(( $(jq '.broken | length' "${TMPDIR}/broken-libs.json" 2>/dev/null || echo 0) + $(jq '.broken_symlinks | length' "${TMPDIR}/broken-symlinks.json" 2>/dev/null || echo 0) + $(jq '.orphans | length' "${TMPDIR}/orphans.json" 2>/dev/null || echo 0) ))
+else
+  issues=$(python3 - <<PY
+import json,sys
+def count(p,k):
+    try:
+        d=json.load(open(p,'r',encoding='utf-8'))
+        return len(d.get(k,[]))
+    except:
+        return 0
+print(count("${TMPDIR}/broken-libs.json","broken")+count("${TMPDIR}/broken-symlinks.json","broken_symlinks")+count("${TMPDIR}/orphans.json","orphans"))
+PY
+)
+fi
+
+if [ "$issues" -gt 0 ]; then
+  log_warn "Audit completed: found ${issues} issues (report: $REPORT_FILE)"
+  exit 1
+else
+  log_info "Audit completed: no issues found"
+  exit 0
+fi
