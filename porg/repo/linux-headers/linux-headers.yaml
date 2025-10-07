@@ -1,0 +1,47 @@
+# linux-headers.yaml
+# Kernel API headers used by glibc (LFS-style)
+# Source and procedure based on LFS chapter for API headers.
+
+name: linux-headers
+version: "6.16.1"
+stage: headers
+category: base
+description: "Linux API headers required for glibc build"
+license: "GPL-2.0"
+homepage: "https://www.kernel.org/"
+
+source:
+  - url: https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.16.1.tar.xz
+    # sha256: <fill-in-after-download>
+
+dependencies:
+  build: []
+  runtime: []
+  optional: []
+
+build_dir: linux-6.16.1
+destdir: build/linux-6.16.1-dest
+
+rebuild_policy: if-newer
+
+graph:
+  parent: toolchain
+  children:
+    - glibc
+
+build:
+  prepare: |
+    tar -xf ../linux-6.16.1.tar.xz
+    cd linux-6.16.1
+  configure: |
+    true  # kernel headers extraction does not use configure
+  compile: |
+    make mrproper
+    make headers
+    # copy headers to $DESTDIR/usr/include (porg will map DESTDIR into chroot)
+  install: |
+    rm -rf ${DESTDIR}/usr/include
+    mkdir -p ${DESTDIR}/usr/include
+    cp -rv usr/include ${DESTDIR}/usr/
+
+# Notes: follow the LFS procedure for "Installing the API headers".
