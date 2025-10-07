@@ -1,0 +1,130 @@
+# ==========================================================
+# PORG METAFILE - EXEMPLO COMPLETO E DOCUMENTADO
+# ----------------------------------------------------------
+# Local sugerido:
+#   /usr/ports/base/gcc/gcc-13.2.0.yaml
+# ==========================================================
+
+# Nome e versão do pacote
+name: gcc
+version: 13.2.0
+
+# Descrição geral (usada no porg --info)
+description: >
+  The GNU Compiler Collection, including front ends for C, C++, Fortran, and more.
+  Core component of the GNU toolchain required to build most software.
+
+# Categoria e grupo (organização interna opcional)
+category: base-system
+group: toolchain
+
+# Fonte(s) de download — suporta múltiplas URLs e mirrors
+source:
+  url:
+    - https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+    - https://mirrors.kernel.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+  sha256: 60b4cdd5b8686f676c3f75cb693b64a4a761a4b92b7f5c019f4d8c508a17916b
+  gpg_sig: https://ftp.gnu.org/gnu/gcc/gcc-13.2.0.tar.xz.sig
+  extract_dir: gcc-13.2.0
+  type: tar.xz
+
+# Patches a serem aplicados antes da compilação
+patches:
+  - fix-libgcc-math.patch
+  - hardened-build-flags.patch
+
+# Dependências do pacote
+dependencies:
+  build:
+    - binutils
+    - glibc
+    - gmp
+    - mpfr
+    - mpc
+  runtime:
+    - libstdc++
+  optional:
+    - zlib
+    - zstd
+  conflicts:
+    - gcc-12.*
+
+# Hooks — scripts executados em etapas específicas
+hooks:
+  pre-build: /etc/porg/hooks/gcc/pre-build.sh
+  post-build: /etc/porg/hooks/gcc/post-build.sh
+  pre-install: /etc/porg/hooks/gcc/pre-install.sh
+  post-install: /etc/porg/hooks/gcc/post-install.sh
+  pre-remove: /etc/porg/hooks/gcc/pre-remove.sh
+  post-remove: /etc/porg/hooks/gcc/post-remove.sh
+
+# Variáveis adicionais usadas no build
+variables:
+  configure_flags: >
+    --prefix=/usr
+    --disable-multilib
+    --enable-languages=c,c++
+    --enable-bootstrap
+  build_env:
+    CFLAGS: "-O2 -pipe"
+    CXXFLAGS: "-O2 -pipe"
+    MAKEFLAGS: "-j$(JOBS)"
+
+# Etapas de build e instalação — cada linha é um comando
+build:
+  - ./configure {{ variables.configure_flags }}
+  - make
+  - make -k check || true
+install:
+  - make install
+  - ln -svf gcc /usr/bin/cc
+
+# Seção de upgrade — usada pelo porg_upgrade.sh
+upgrade:
+  resume: true
+  backup_old: true
+  backup_path: /var/backups/porg/gcc
+  verify_checksums: true
+  reinstall_if_failed: true
+  triggers:
+    - /etc/porg/hooks/gcc/on-upgrade.sh
+
+# Informações de auditoria — usadas por porg_audit.sh
+audit:
+  check_libs: true
+  check_links: true
+  check_perms: true
+  check_orphans: true
+  check_vulns: true
+  check_scripts: true
+  vuln_sources:
+    - https://cve.mitre.org
+    - https://security.archlinux.org
+    - https://security-tracker.debian.org/tracker
+
+# Lista de arquivos relevantes para logs, manifestos e checksums
+files:
+  manifest: /var/lib/porg/manifests/gcc-13.2.0.manifest
+  checksumfile: /var/lib/porg/checksums/gcc-13.2.0.sha256
+  logfile: /var/log/porg/build/gcc-13.2.0.log
+  auditlog: /var/log/porg/audit/gcc-13.2.0.audit.log
+
+# Ações de pós-instalação (executadas pelo builder)
+post_actions:
+  - ldconfig
+  - gcc --version > /var/log/porg/gcc-version.txt
+  - echo "GCC 13.2.0 installed successfully."
+
+# Informações extras
+metadata:
+  maintainer: "Fernando Canata <fernando@example.com>"
+  license: "GPL-3.0-or-later"
+  homepage: "https://gcc.gnu.org"
+  repo: "https://gcc.gnu.org/git/gcc.git"
+  build_system: "autotools"
+  arch: "x86_64"
+  platforms:
+    - linux
+  auto_rebuild: true
+  log_level: verbose
+  quiet_mode: false
