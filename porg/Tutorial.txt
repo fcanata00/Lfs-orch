@@ -66,6 +66,9 @@ Ferramentas básicas exigidas pelo Porg:
 sudo apt install bash binutils bison coreutils diffutils findutils \
 gawk gcc g++ grep gzip make patch perl python3 sed tar texinfo xz-utils zstd git fakeroot bubblewrap
 ------------------------------------
+E depois 
+porg --check-deps
+----------------------
 
 Durante o bootstrap LFS:
 - chroot (ou bubblewrap)
