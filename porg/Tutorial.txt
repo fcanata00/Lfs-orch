@@ -1,0 +1,219 @@
+PORG - Package Orchestrator and Rebuilder for GNU/Linux
+=======================================================
+
+1. INTRODUÇÃO
+-------------
+O Porg (Package ORchestrator and Generator) é um sistema de gerenciamento e
+construção modular de pacotes voltado para ambientes Linux From Scratch (LFS e BLFS).
+Ele permite construir, atualizar e auditar sistemas inteiros de forma automatizada,
+seguindo receitas YAML conhecidas como “metafiles”.
+
+O Porg combina Bash, Python e chroot/bubblewrap para criar um ambiente isolado,
+com logs coloridos, verificação de dependências, auditorias e controle total de
+todas as etapas de construção de um Linux.
+
+Principais características:
+- Construção automatizada em ambiente seguro (chroot/bubblewrap)
+- Resolução de dependências em Python
+- Registro e auditoria completos em banco de dados local
+- Suporte a hooks de pré/pós build, instalação e remoção
+- Sistema de log colorido e detalhado
+- Modo quiet com animações e barra de progresso
+- Suporte total ao processo de bootstrap do Linux From Scratch
+
+
+2. ESTRUTURA DE DIRETÓRIOS
+---------------------------
+Padrão de diretórios utilizado pelo Porg:
+
+/usr/bin/porg                      -> Orquestrador principal (executável)
+/usr/lib/porg/                     -> Módulos internos
+  ├── porg_builder.sh              -> Módulo de construção
+  ├── porg_logger.sh               -> Módulo de log e registro
+  ├── porg_db.sh                   -> Banco de dados de pacotes
+  ├── porg_deps.py                 -> Resolução de dependências
+  ├── porg_remove.sh               -> Remoção de pacotes
+  ├── porg_upgrade.sh              -> Atualização e upgrade de sistema
+  ├── porg_resolve.sh              -> Revdep + Depclean
+  ├── porg_audit.sh                -> Auditoria de sistema
+  ├── porg_bootstrap.sh            -> Bootstrap LFS/BLFS
+/etc/porg/porg.conf                -> Configuração global
+/usr/share/bash-completion/completions/porg -> Auto-completar bash
+/usr/ports/                        -> Metafiles YAML (receitas de pacotes)
+/var/log/porg/                     -> Logs e relatórios
+/var/lib/porg/                     -> Banco de dados e estado
+/var/tmp/porg/                     -> Diretório de trabalho temporário
+/mnt/lfs                           -> Local padrão para construção de sistemas LFS
+
+
+3. DEPENDÊNCIAS NECESSÁRIAS
+----------------------------
+Ferramentas básicas exigidas pelo Porg:
+- bash (>= 5.0)
+- coreutils
+- curl
+- tar, xz, zstd, gzip, bzip2
+- file, patch, make, sed, awk
+- git
+- fakeroot
+- python3 (com PyYAML)
+- bubblewrap (opcional, recomendado)
+- gcc e binutils
+- util-linux
+- parallel (opcional, para builds paralelos)
+
+Durante o bootstrap LFS:
+- chroot (ou bubblewrap)
+- binutils, gcc, glibc e ferramentas básicas de build
+
+
+4. INSTALAÇÃO DO PORG
+----------------------
+1. Copie os módulos para seus locais:
+
+   sudo mkdir -p /usr/lib/porg
+   sudo cp porg_*.sh /usr/lib/porg/
+   sudo cp porg_deps.py /usr/lib/porg/
+   sudo cp porg /usr/bin/porg
+   sudo chmod +x /usr/bin/porg /usr/lib/porg/*.sh
+
+2. Copie o arquivo de configuração e bash completion:
+
+   sudo mkdir -p /etc/porg /usr/share/bash-completion/completions/
+   sudo cp porg.conf /etc/porg/porg.conf
+   sudo cp porg_completions.bash /usr/share/bash-completion/completions/porg
+
+3. Verifique dependências:
+   sudo porg --check-deps
+
+4. Teste o orquestrador:
+   porg --help
+
+
+5. CONFIGURAÇÃO
+----------------
+O arquivo /etc/porg/porg.conf contém todas as variáveis globais.
+
+Exemplo básico:
+
+WORKDIR="/var/tmp/porg/work"
+LOGDIR="/var/log/porg"
+HOOKDIR="/etc/porg/hooks"
+DBFILE="/var/lib/porg/porg.db"
+REPO_DIR="/usr/ports"
+GIT_REPO="https://github.com/seu-repo/porg-ports.git"
+CHROOT_METHOD="bwrap"
+LFS="/mnt/lfs"
+JOBS="$(nproc)"
+
+
+6. PRINCIPAIS COMANDOS DO PORG
+-------------------------------
+porg --install <pacote>        Instala o pacote completo (download → build → install)
+porg -i <pacote>               Forma abreviada
+porg --remove <pacote>         Remove o pacote e dependências órfãs
+porg -r <pacote>               Abreviado
+porg --upgrade                 Atualiza todos os pacotes do sistema
+porg -u                        Abreviado
+porg --resolve --scan          Executa revdep e depclean
+porg --audit                   Faz auditoria do sistema
+porg --bootstrap full           Executa bootstrap completo do LFS
+porg --init                    Cria diretórios e estrutura inicial
+porg --sync                    Sincroniza os metafiles com o repositório Git
+porg --info <pacote>           Mostra informações e grafo de dependências
+porg --search <nome>           Procura um pacote
+porg --clean-logs              Limpa logs antigos
+
+
+7. COMO CRIAR UM BOOTSTRAP COMPLETO
+-----------------------------------
+1. Prepare o diretório do LFS:
+   sudo mkdir -pv /mnt/lfs/{sources,tools}
+   sudo chown -v $(whoami) /mnt/lfs/{sources,tools}
+
+2. Configure o porg.conf com:
+   LFS="/mnt/lfs"
+
+3. Crie o arquivo /usr/ports/bootstrap.yaml com a lista de pacotes do toolchain.
+
+4. Execute o bootstrap:
+   sudo porg_bootstrap.sh full
+
+   O processo faz:
+   - Montagem de /mnt/lfs
+   - Criação do usuário lfs
+   - Compilação completa do toolchain (binutils, gcc, glibc...)
+   - Criação de checkpoints
+   - Entrada no chroot automaticamente
+
+5. Para retomar após erro:
+   sudo porg_bootstrap.sh resume
+
+6. Para entrar manualmente no chroot:
+   sudo porg_bootstrap.sh enter
+
+7. Após finalização:
+   sudo porg_bootstrap.sh clean
+
+
+8. CRIAÇÃO DE METAFILES (RECEITAS)
+-----------------------------------
+Cada pacote é descrito por um arquivo YAML em /usr/ports/base/<pacote>/<versão>.yaml
+
+Exemplo:
+-------------------------------------------------
+name: gcc
+version: 13.2.0
+source:
+  url: https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+  sha256: abc123...
+patches:
+  - fix-paths.patch
+build:
+  - ./configure --prefix=/usr --disable-multilib
+  - make -j$(JOBS)
+install:
+  - make install
+deps:
+  - binutils
+  - glibc
+hooks:
+  pre-build: /etc/porg/hooks/gcc/pre-build.sh
+  post-install: /etc/porg/hooks/gcc/post-install.sh
+-------------------------------------------------
+
+
+9. AUDITORIA E RECUPERAÇÃO
+---------------------------
+Para verificar problemas de libs, links quebrados e pacotes órfãos:
+  sudo porg --audit
+
+Para reconstruir automaticamente pacotes corrompidos:
+  sudo porg --resolve --scan
+
+
+10. LOGS E RELATÓRIOS
+----------------------
+Todos os logs são armazenados em:
+  /var/log/porg/
+  /var/log/porg/bootstrap/
+  /var/log/porg/packages/
+
+Relatórios finais incluem tempo total, CPU usada e memória.
+
+
+11. DICAS DE USO
+----------------
+- Sempre rode como root ou com sudo ao construir pacotes do sistema.
+- Utilize “--dry-run” para testar uma instalação sem executar.
+- Para aumentar performance, ative paralelismo com “JOBS=$(nproc)” no porg.conf.
+- Use “--quiet” para ocultar saída detalhada de compilação.
+- Mantenha o repositório de metafiles atualizado com “porg --sync”.
+
+
+12. CONCLUSÃO
+--------------
+O Porg fornece um sistema modular, seguro e expansível para construir
+e manter um Linux From Scratch de maneira automatizada e confiável.
+Com suporte a auditoria, reconstrução e atualizações completas, ele
+substitui scripts manuais, reduzindo erros e aumentando a reprodutibilidade.
