@@ -1,0 +1,51 @@
+# glibc.yaml
+# GNU C Library - used in bootstrap after headers+pass1 toolchain available
+# Follow LFS chapter for glibc installation.
+
+name: glibc
+version: "2.42"
+stage: libc
+category: base
+description: "GNU C Library (glibc)"
+homepage: "https://www.gnu.org/software/libc/"
+
+source:
+  - url: https://ftp.gnu.org/gnu/libc/glibc-2.42.tar.xz
+    # sha256: <fill-in-after-download>
+
+dependencies:
+  build:
+    - linux-headers
+    - gcc
+  runtime: []
+  optional: []
+
+build_dir: glibc-2.42
+destdir: build/glibc-2.42-dest
+
+rebuild_policy: if-newer
+
+graph:
+  parent: toolchain
+  children:
+    - libstdcxx
+
+build:
+  prepare: |
+    tar -xf ../glibc-2.42.tar.xz
+    mkdir -v build
+    cd build
+  configure: |
+    ../configure --prefix=/usr \
+                 --host=$LFS_TGT \
+                 --build=$(uname -m)-pc-linux-gnu \
+                 --with-headers=${DESTDIR}/usr/include \
+                 libc_cv_slibdir=/usr/lib
+  compile: |
+    make -j$(nproc)
+  install: |
+    make DESTDIR=${DESTDIR} install
+
+# Notes:
+# - This glibc step assumes linux headers and pass1 toolchain are usable.
+# - Adjust LIBDIR or other envs if your target differs.
