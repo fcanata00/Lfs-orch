@@ -62,6 +62,11 @@ Ferramentas básicas exigidas pelo Porg:
 - util-linux
 - parallel (opcional, para builds paralelos)
 
+--------------.------------------------------
+sudo apt install bash binutils bison coreutils diffutils findutils \
+gawk gcc g++ grep gzip make patch perl python3 sed tar texinfo xz-utils zstd git fakeroot bubblewrap
+------------------------------------
+
 Durante o bootstrap LFS:
 - chroot (ou bubblewrap)
 - binutils, gcc, glibc e ferramentas básicas de build
