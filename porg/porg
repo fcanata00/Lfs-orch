@@ -1,368 +1,174 @@
 #!/usr/bin/env bash
 #
-# porg - Orquestrador Porg (versão aprimorada)
-# Recursos adicionais: flock lockfile, checkpoints/resume, search, info, graph (ASCII), status, history, repair
+# porg - Orquestrador principal do Porg (versão integrada com --bootstrap)
+# Modo de saída: técnico/contínuo (verbose). Use --quiet para saída compacta.
 #
 set -euo pipefail
 IFS=$'\n\t'
 
-# ------------------ Config e paths ------------------
+# -------------------- Carrega configuração --------------------
 PORG_CONF="${PORG_CONF:-/etc/porg/porg.conf}"
-[ -f "$PORG_CONF" ] && source "$PORG_CONF"
+[ -f "$PORG_CONF" ] && source "$PORG_CONF" || true
 
-LIBDIR="${LIBDIR:-/usr/lib/porg}"
-BUILDER="${BUILDER:-${LIBDIR}/porg_builder.sh}"
-REMOVER="${REMOVER:-${LIBDIR}/porg_remove.sh}"
-UPGRADER="${UPGRADER:-${LIBDIR}/porg_upgrade.sh}"
-RESOLVER="${RESOLVER:-${LIBDIR}/porg_resolve.sh}"
-AUDITOR="${AUDITOR:-${LIBDIR}/porg_audit.sh}"
-DEPS_PY="${DEPS_PY:-${LIBDIR}/porg_deps.py}"
-DB_SCRIPT="${DB_SCRIPT:-${LIBDIR}/porg_db.sh}"
-LOGGER_SCRIPT="${LOGGER_SCRIPT:-${LIBDIR}/porg_logger.sh}"
-
+# Valores padrão (se não fornecidos no porg.conf)
+LIBDIR="${MODULES_DIR:-${LIBDIR:-/usr/lib/porg}}"
 WORKDIR="${WORKDIR:-/var/tmp/porg}"
-LOGDIR="${LOGDIR:-/var/log/porg}"
-REPORT_DIR="${REPORT_DIR:-${LOGDIR}}"
+CACHE_DIR="${CACHE_DIR:-${WORKDIR}/cache}"
+LOGDIR="${LOG_DIR:-/var/log/porg}"
 STATE_DIR="${STATE_DIR:-/var/lib/porg/state}"
 PORTS_DIR="${PORTS_DIR:-/usr/ports}"
-LOCKFILE="${LOCKFILE:-/var/lock/porg.lock}"
-LOCK_TIMEOUT="${LOCK_TIMEOUT:-30}"
+BOOTSTRAP_SCRIPT="${PORG_BOOTSTRAP:-${LIBDIR}/porg_bootstrap.sh}"
 
-mkdir -p "$WORKDIR" "$LOGDIR" "$REPORT_DIR" "$STATE_DIR" "$(dirname "$LOCKFILE")"
+mkdir -p "$WORKDIR" "$CACHE_DIR" "$LOGDIR" "$STATE_DIR"
 
-# ------------------ Logger (fallback) ------------------
-if [ -f "$LOGGER_SCRIPT" ]; then
-  # shellcheck disable=SC1090
-  source "$LOGGER_SCRIPT" || true
+# -------------------- UI / cores --------------------
+if command -v tput >/dev/null 2>&1 && [ -t 1 ]; then
+  C_RED="$(tput setaf 1)" || C_RED="\e[31m"
+  C_GREEN="$(tput setaf 2)" || C_GREEN="\e[32m"
+  C_YELLOW="$(tput setaf 3)" || C_YELLOW="\e[33m"
+  C_CYAN="$(tput setaf 6)" || C_CYAN="\e[36m"
+  C_BOLD="$(tput bold)" || C_BOLD="\e[1m"
+  C_RESET="$(tput sgr0)" || C_RESET="\e[0m"
 else
-  log_info(){ printf "%s [INFO] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
-  log_warn(){ printf "%s [WARN] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
-  log_error(){ printf "%s [ERROR] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+  C_RED="\e[31m"; C_GREEN="\e[32m"; C_YELLOW="\e[33m"; C_CYAN="\e[36m"; C_BOLD="\e[1m"; C_RESET="\e[0m"
 fi
 
-_have(){ command -v "$1" >/dev/null 2>&1; }
-_timestamp(){ date -u +%Y%m%dT%H%M%SZ; }
+# -------------------- Flags globais --------------------
+DRY_RUN=false
+AUTO_YES=false
+QUIET=false
+PROGRESS=false
+PARALLEL_N="$(nproc 2>/dev/null || echo 1)"
+JSON_OUT=false
+USE_BWRAP=false
+
+# -------------------- Logger (respeita QUIET) --------------------
+log_level_priority() { case "$1" in DEBUG) echo 0;; INFO) echo 1;; WARN) echo 2;; ERROR) echo 3;; esac; }
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
+log_should_print() {
+  # if QUIET true: only WARN and ERROR printed
+  local level="$1"
+  if [ "$QUIET" = true ]; then
+    [ "$(log_level_priority "$level")" -ge "$(log_level_priority WARN)" ] && return 0 || return 1
+  fi
+  # else compare with LOG_LEVEL
+  [ "$(log_level_priority "$level")" -ge "$(log_level_priority "$LOG_LEVEL")" ] && return 0 || return 1
+}
+log() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if log_should_print "$level"; then
+    case "$level" in
+      DEBUG) printf "%s %b[DEBUG]%b %s\n" "$ts" "$C_CYAN" "$C_RESET" "$msg" ;;
+      INFO)  printf "%s %b[INFO]%b  %s\n" "$ts" "$C_GREEN" "$C_RESET" "$msg" ;;
+      WARN)  printf "%s %b[WARN]%b  %s\n" "$ts" "$C_YELLOW" "$C_RESET" "$msg" >&2 ;;
+      ERROR) printf "%s %b[ERROR]%b %s\n" "$ts" "$C_RED" "$C_RESET" "$msg" >&2 ;;
+      *)     printf "%s [LOG] %s\n" "$ts" "$msg" ;;
+    esac
+  fi
+  # always append to logfile
+  mkdir -p "$LOGDIR"
+  printf "%s [%s] %s\n" "$ts" "$level" "$msg" >> "${LOGDIR}/porg-$(date +%Y%m%d).log"
+}
+
+log_debug(){ log DEBUG "$*"; }
+log_info(){ log INFO "$*"; }
+log_warn(){ log WARN "$*"; }
+log_error(){ log ERROR "$*"; }
+
 _die(){ log_error "$*"; exit 2; }
 
-# ------------------ Locking (flock) ------------------
-_acquire_lock(){
-  exec 200>"$LOCKFILE"
-  if _have flock; then
-    flock -n 200 || { log_warn "Another porg instance is running. If stale, remove $LOCKFILE"; exit 1; }
-  else
-    # naive lock
-    if [ -e "$LOCKFILE" ]; then
-      pid=$(cat "$LOCKFILE" 2>/dev/null || echo "")
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        log_warn "Another porg instance ($pid) is running. Exit."
-        exit 1
-      else
-        log_warn "Stale lockfile found; removing."
-        rm -f "$LOCKFILE"
-      fi
-    fi
-    echo $$ > "$LOCKFILE"
-    # register a trap to remove
-    trap '_release_lock' EXIT
-  fi
-}
-_release_lock(){
-  if _have flock; then
-    flock -u 200 2>/dev/null || true
-  fi
-  [ -f "$LOCKFILE" ] && rm -f "$LOCKFILE" || true
-}
+# -------------------- Helpers --------------------
+_have(){ command -v "$1" >/dev/null 2>&1; }
+_timestamp(){ date -u +%Y%m%dT%H%M%SZ; }
 
-# ------------------ State (checkpoint/resume) ------------------
-# State files per package: $STATE_DIR/<pkg>.state (JSON)
-save_state(){
-  local pkg="$1"; local phase="$2"; local extra="${3:-}"
-  mkdir -p "$STATE_DIR"
-  cat > "${STATE_DIR}/${pkg}.state" <<JSON
-{"package":"${pkg}","phase":"${phase}","extra":"${extra}","ts":"$(_timestamp)"}
-JSON
-}
-load_state(){
-  local pkg="$1"
-  if [ -f "${STATE_DIR}/${pkg}.state" ]; then
-    cat "${STATE_DIR}/${pkg}.state"
-  else
-    echo "{}"
-  fi
-}
-clear_state(){
-  local pkg="$1"
-  [ -f "${STATE_DIR}/${pkg}.state" ] && rm -f "${STATE_DIR}/${pkg}.state"
-}
-list_states(){
-  ls -1 "$STATE_DIR"/*.state 2>/dev/null || true
-}
-
-# ------------------ Helpers: metafile parsing, search, info ------------------
-# try to find metafile by package name under /usr/ports
-find_metafile_for_pkg(){
-  local pkg="$1"
-  # search for a yaml file with package name in filename or with name field inside
-  if [ -d "$PORTS_DIR" ]; then
-    # fast filename search
-    local f
-    f=$(find "$PORTS_DIR" -type f -iname "*${pkg}*.ya*ml" -print -quit 2>/dev/null || true)
-    if [ -n "$f" ]; then
-      echo "$f" && return 0
-    fi
-    # fallback: scan yaml content
-    if _have python3; then
-      find "$PORTS_DIR" -type f -iname '*.ya*ml' -print0 2>/dev/null | xargs -0 -n1 -I{} python3 - <<PY 2>/dev/null
-import sys,yaml,json
-p=sys.argv[1]
-try:
-  d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
-  name=d.get('name') or d.get('pkg') or ''
-  if name and "$pkg" in name:
-    print(p)
-    sys.exit(0)
-except Exception:
-  pass
-PY
-"$f"
-    fi
-  fi
-  return 1
-}
-
-# search for packages (simple)
-cmd_search(){
-  local term="$1"
-  if [ -z "$term" ]; then _die "Use: porg --search <termo>"; fi
-  log_stage "Searching for: $term"
-  # prefer python yaml parse if available for nicer output
-  if _have python3; then
-    python3 - <<PY
-import os,sys,fnmatch
-ports_dir="${PORTS_DIR}"
-term="${term}".lower()
-for root,dirs,files in os.walk(ports_dir):
-    for fn in files:
-        if fn.lower().endswith(('.yml','.yaml')):
-            p=os.path.join(root,fn)
-            try:
-                import yaml
-                d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
-                name=d.get('name') or fn.rsplit('.',1)[0]
-                desc=d.get('description') or d.get('summary') or ''
-                if term in name.lower() or term in str(desc).lower():
-                    print(f"{name}  - {desc}  ({p})")
-            except Exception:
-                # fallback simple grep
-                try:
-                    txt=open(p,'r',encoding='utf-8').read().lower()
-                    if term in txt:
-                        print(f"{fn.rsplit('.',1)[0]}  - (match in {p})")
-                except:
-                    pass
-            except BaseException:
-                pass
-PY
-  else
-    grep -RIl --exclude-dir=.git --exclude='*.lock' --include='*.ya*ml' -- "${term}" "${PORTS_DIR}" 2>/dev/null | sed -n 's#.*/##;s/\..*$//p'
-  fi
-}
-
-# info about program
-cmd_info(){
-  local pkg="$1"
-  if [ -z "$pkg" ]; then _die "Use: porg --info <pkg>"; fi
-  log_stage "Info for: $pkg"
-  local mf
-  mf=$(find_metafile_for_pkg "$pkg" || true)
-  if [ -n "$mf" ]; then
-    if _have python3; then
-      python3 - <<PY
-import yaml,json,sys
-p=sys.argv[1]
-try:
-  d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
-except Exception:
-  print("Unable to parse metafile",p)
-  sys.exit(1)
-print("Metafile:",p)
-print("Name:",d.get('name'))
-print("Version:",d.get('version') or d.get('ver'))
-print("Summary:",d.get('description') or d.get('summary') or '')
-print("Category/path:",p)
-print("Dependencies:",d.get('dependencies') or d.get('deps') or [])
-print("Source(s):",d.get('source_url') or d.get('source_urls') or d.get('sources') or '')
-print("License:",d.get('license') or '')
-PY
-    else
-      awk 'BEGIN{FS=": "}/^name:|^version:|^description:|^summary:|^license:/{print}' "$mf"
-      echo "Metafile: $mf"
-    fi
-  else
-    log_warn "Metafile not found for $pkg under $PORTS_DIR"
-  fi
-  # installed status via DB
-  if [ -x "$DB_SCRIPT" ]; then
-    "$DB_SCRIPT" status "$pkg" || true
-  else
-    log_info "DB script not available to show installed state"
-  fi
-  # state file (checkpoint)
-  if [ -f "${STATE_DIR}/${pkg}.state" ]; then
-    echo "Resume state:"
-    cat "${STATE_DIR}/${pkg}.state"
-  fi
-}
-
-# ------------------ Graph ASCII (--graph) ------------------
-# We will try to use deps.py graph if available; else fallback to parsing metafile dependencies recursively
-graph_ascii_recursive(){
-  local pkg="$1"
-  local depth="${2:-0}"
-  local prefix="${3:-}"
-  local visited_file="$4"
-  # protect cycles
-  if grep -qx "$pkg" "$visited_file" 2>/dev/null; then
-    printf "%s%s (cycle)\n" "$prefix" "$pkg"
-    return
-  fi
-  echo "$pkg" >> "$visited_file"
-  # find direct deps
-  local deps=()
-  if [ -x "$DEPS_PY" ]; then
-    # request JSON from deps.py
-    mapfile -t deps < <("$DEPS_PY" graph-deps --pkg "$pkg" --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin) if not sys.stdin.isatty() else {}; print('\\n'.join(d.get('deps',[])))" 2>/dev/null || true)
-  fi
-  # fallback to metafile
-  if [ "${#deps[@]}" -eq 0 ]; then
-    local mf
-    mf=$(find_metafile_for_pkg "$pkg" || true)
-    if [ -n "$mf" ] && _have python3; then
-      mapfile -t deps < <(python3 - <<PY
-import yaml,sys
-p=sys.argv[1]
-try:
-  d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
-except:
-  d={}
-deps=d.get('dependencies') or d.get('deps') or d.get('requires') or []
-out=[]
-if isinstance(deps, dict):
-    for k in deps:
-        v=deps.get(k) or []
-        if isinstance(v, list): out+=v
-elif isinstance(deps, list):
-    out+=deps
-elif isinstance(deps, str):
-    out.append(deps)
-for i in out:
-    print(i)
-PY
-"$mf")
-    fi
-  fi
-  # print ascii tree
-  local i=0
-  for d in "${deps[@]}"; do
-    i=$((i+1))
-    if [ $i -eq ${#deps[@]} ]; then
-      printf "%s└─ %s\n" "$prefix" "$d"
-      graph_ascii_recursive "$d" $((depth+1)) "${prefix}   " "$visited_file"
-    else
-      printf "%s├─ %s\n" "$prefix" "$d"
-      graph_ascii_recursive "$d" $((depth+1)) "${prefix}│  " "$visited_file"
-    fi
-  done
-}
-
-cmd_graph(){
-  local pkg="$1"
-  if [ -z "$pkg" ]; then _die "Use: porg --graph <pkg>"; fi
-  log_stage "Dependency graph for $pkg (ASCII)"
-  # prepare visited file
-  local vf="${STATE_DIR}/graph-${pkg}.$(_timestamp).visited"
-  : > "$vf"
-  printf "%s\n" "$pkg"
-  graph_ascii_recursive "$pkg" 0 "" "$vf"
-  rm -f "$vf"
-}
-
-# ------------------ Status, history, repair ------------------
-cmd_status(){
-  log_stage "System status summary"
-  # number of installed packages via DB
-  if [ -f "/var/lib/porg/db/installed.json" ] && command -v jq >/dev/null 2>&1; then
-    local count
-    count=$(jq 'length' /var/lib/porg/db/installed.json 2>/dev/null || echo 0)
-    echo "Installed packages: $count"
-  else
-    echo "Installed DB not available"
-  fi
-  echo "State checkpoints: "
-  ls -1 "$STATE_DIR"/*.state 2>/dev/null | sed -e 's#^.*/##' || true
-  echo "Recent reports in $REPORT_DIR:"
-  ls -1t "$REPORT_DIR"/*.{log,json} 2>/dev/null | head -n 10 || true
-}
-
-cmd_history(){
-  log_stage "Showing recent build/install logs"
-  ls -1t "$REPORT_DIR"/*.log 2>/dev/null | head -n 20 | xargs -r -n1 tail -n 200
-}
-
-cmd_repair(){
-  log_stage "Repair: running resolve + audit"
-  if [ -x "$RESOLVER" ]; then
-    _call_module "$RESOLVER" --all --quiet || log_warn "Resolver returned non-zero"
-  else
-    log_warn "Resolver module not present"
-  fi
-  if [ -x "$AUDITOR" ]; then
-    _call_module "$AUDITOR" --fix --quiet || log_warn "Auditor returned non-zero"
-  else
-    log_warn "Auditor not present"
-  fi
-}
-
-# wrapper to call module with dry-run support
 _call_module(){
   local module="$1"; shift
-  if [ "${DRY_RUN:-false}" = true ]; then
-    log_info "[DRY-RUN] Would call $module $*"
+  if [ "${DRY_RUN}" = true ]; then
+    log_info "[DRY-RUN] Would call: $module $*"
     return 0
   fi
   if [ -x "$module" ]; then
     "$module" "$@"
     return $?
   else
-    log_warn "Module not executable: $module"
+    log_warn "Module not found or not executable: $module"
     return 2
   fi
 }
 
-# ------------------ Command dispatch ------------------
+# use bwrap if requested and available
+_call_module_safe(){
+  local module="$1"; shift
+  if [ "$USE_BWRAP" = true ] && _have bwrap; then
+    bwrap --dev /dev --proc /proc --ro-bind /usr /usr --tmpfs /tmp --bind "$LIBDIR" "$LIBDIR" --die-with-parent "$module" "$@"
+  else
+    _call_module "$module" "$@"
+  fi
+}
+
+# spinner & monitor are available but in mode B we print everything continuously;
+# spinner used only when QUIET=false and PROGRESS=true
+SPINNER_PID=""
+start_spinner(){
+  local msg="${1:-working...}"
+  if [ "$PROGRESS" = true ] && [ "$QUIET" = false ] && [ -t 1 ]; then
+    ( while :; do for s in '/-\|'; do printf "\r%s %s" "$s" "$msg"; sleep 0.12; done; done ) &
+    SPINNER_PID=$!
+    disown
+  fi
+}
+stop_spinner(){
+  if [ -n "${SPINNER_PID:-}" ]; then
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    unset SPINNER_PID
+    printf "\r"
+  fi
+}
+
+# -------------------- Usage --------------------
 usage(){
   cat <<EOF
-porg - orchestrator
-Usage:
-  porg --init
-  porg --install <pkg>...
-  porg --remove <pkg>...
-  porg --upgrade [pkg...]
-  porg --search <term>
-  porg --info <pkg>
-  porg --graph <pkg>
-  porg --status
-  porg --history
-  porg --repair
-  porg --resume <pkg>
-  flags: --dry-run --yes --quiet --progress --parallel N --json
+Usage: porg [global-options] <command> [args]
+
+Global options:
+  --dry-run           Simula as ações
+  --yes               Auto confirma prompts
+  --quiet             Saída compacta (apenas WARN/ERROR)
+  --progress          Mostra barra/monitor (quando aplicável)
+  --parallel N        Paralelismo para builds
+  --bwrap             Força usar bubblewrap quando possível
+
+Commands:
+  --init              Cria diretórios e estrutura inicial
+  --install, -i pkg   Resolve deps, build e instala pacote
+  --remove, -r pkg    Remove pacote (com revdep/depclean)
+  --upgrade [pkgs]    Executa upgrade (ou world se vazio)
+  --resolve           Executa revdep+depclean
+  --audit             Executa auditoria do sistema
+  --sync              Sincroniza metafiles (git pull) e deps
+  --db [args]         Ações do DB (status/register/... via porg_db.sh)
+  --logs              Exibe logs recentes
+  --search term       Procura pacotes em /usr/ports
+  --info pkg          Mostra info do pacote
+  --graph pkg         Mostra grafo ASCII de dependências
+  --bootstrap [sub]   Bootstrap LFS: prepare|full|resume|clean|enter
+  --help              Mostra esta ajuda
+
+Examples:
+  porg -i gcc
+  porg --bootstrap full
 EOF
   exit 1
 }
 
-# parse top level global flags and command
-DRY_RUN=false; AUTO_YES=false; QUIET=false; PROGRESS=false; PARALLEL_N=$(nproc 2>/dev/null || echo 1)
+# -------------------- Parse global options --------------------
+if [ $# -eq 0 ]; then usage; fi
 CMD=""; ARGS=()
+# We'll parse until we hit a recognized command
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift;;
@@ -370,119 +176,396 @@ while [ $# -gt 0 ]; do
     --quiet) QUIET=true; shift;;
     --progress) PROGRESS=true; shift;;
     --parallel) PARALLEL_N="${2:-$PARALLEL_N}"; shift 2;;
-    --init|--install|--remove|--upgrade|--search|--info|--graph|--status|--history|--repair|--resume|--help)
+    --bwrap) USE_BWRAP=true; shift;;
+    --init|--install|-i|--remove|-r|--upgrade|--resolve|--audit|--sync|--db|--logs|--search|--info|--graph|--bootstrap|--help)
       CMD="$1"; shift; ARGS=("$@"); break;;
-    *) echo "Unknown option: $1"; usage;;
+    *) 
+      # treat as command if starts with porg-? else unknown
+      if [[ "$1" =~ ^- ]]; then echo "Unknown option: $1"; usage; fi
+      CMD="$1"; shift; ARGS=("$@"); break;;
   esac
 done
 
-[ -n "$CMD" ] || usage
-
-# Acquire lock
-_acquire_lock
-
-# Dispatch
+# normalize aliases
 case "$CMD" in
-  --init)
-    mkdir -p /etc/porg "$LIBDIR" "$PORTS_DIR" "$WORKDIR" "$LOGDIR" "$STATE_DIR" "/var/lib/porg/db"
-    log_info "Initialized directories. Edit /etc/porg/porg.conf as needed."
-    ;;
-
-  --search)
-    cmd_search "${ARGS[0]:-}"
-    ;;
-
-  --info)
-    cmd_info "${ARGS[0]:-}"
-    ;;
-
-  --graph)
-    cmd_graph "${ARGS[0]:-}"
-    ;;
-
-  --status)
-    cmd_status
-    ;;
-
-  --history)
-    cmd_history
-    ;;
-
-  --repair)
-    cmd_repair
-    ;;
-
-  --resume)
-    pkg="${ARGS[0]:-}"
-    if [ -z "$pkg" ]; then _die "Use: porg --resume <pkg>"; fi
-    st=$(load_state "$pkg")
-    if [ "$st" = "{}" ]; then
-      log_warn "No state found for $pkg"
-      exit 1
-    fi
-    phase=$(echo "$st" | python3 -c "import sys,json; print(json.load(sys.stdin).get('phase',''))" 2>/dev/null || true)
-    log_info "Resuming $pkg from phase: $phase"
-    # simple resume behavior: call builder for the package (builder should handle repeated runs idempotently)
-    if [ -x "$BUILDER" ]; then
-      _call_module "$BUILDER" build "$pkg"
-      clear_state "$pkg"
-    else
-      log_warn "Builder not found"
-    fi
-    ;;
-
-  --install)
-    if [ "${#ARGS[@]}" -eq 0 ]; then _die "Use: porg --install <pkg>..."; fi
-    for pkg in "${ARGS[@]}"; do
-      save_state "$pkg" "pre-resolve"
-      if [ -x "$DEPS_PY" ]; then
-        if [ "$DRY_RUN" = true ]; then
-          log_info "[DRY-RUN] Would resolve deps for $pkg"
-        else
-          "$DEPS_PY" resolve "$pkg" || log_warn "deps.py resolve for $pkg returned non-zero"
-        fi
-      fi
-      save_state "$pkg" "resolved"
-      save_state "$pkg" "pre-build"
-      # call builder: builder is expected to accept metafile name or package name
-      if [ "$DRY_RUN" = false ]; then
-        _call_module "$BUILDER" build "$pkg" || { log_warn "Build failed for $pkg"; continue; }
-      else
-        log_info "[DRY-RUN] Skipping actual build for $pkg"
-      fi
-      save_state "$pkg" "built"
-      # install: builder usually installs to DESTDIR or packages; we try to register
-      if [ -x "$DB_SCRIPT" ] && [ "$DRY_RUN" = false ]; then
-        "$DB_SCRIPT" register "$pkg" || log_warn "DB register failed for $pkg"
-      fi
-      clear_state "$pkg"
-    done
-    ;;
-
-  --remove)
-    if [ "${#ARGS[@]}" -eq 0 ]; then _die "Use: porg --remove <pkg>..."; fi
-    for pkg in "${ARGS[@]}"; do
-      _call_module "$REMOVER" "$pkg" --yes
-    done
-    ;;
-
-  --upgrade)
-    # pass-through to upgrader
-    _call_module "$UPGRADER" "$@"
-    ;;
-
-  --resolve)
-    _call_module "$RESOLVER" --all
-    ;;
-
-  --audit)
-    _call_module "$AUDITOR" --all
-    ;;
-
-  *)
-    usage
-    ;;
+  -i) CMD="--install";;
+  -r) CMD="--remove";;
 esac
 
-_release_lock
+# -------------------- Ensure LIBDIR exists --------------------
+[ -d "$LIBDIR" ] || mkdir -p "$LIBDIR"
+
+# -------------------- Module paths (defaults if not in config) --------------------
+PORG_BUILDER="${PORG_BUILDER:-${LIBDIR}/porg_builder.sh}"
+PORG_REMOVE="${PORG_REMOVE:-${LIBDIR}/porg_remove.sh}"
+PORG_UPGRADE="${PORG_UPGRADE:-${LIBDIR}/porg_upgrade.sh}"
+PORG_RESOLVE="${PORG_RESOLVE:-${LIBDIR}/porg_resolve.sh}"
+PORG_AUDIT="${PORG_AUDIT:-${LIBDIR}/porg_audit.sh}"
+PORG_DB="${PORG_DB:-${LIBDIR}/porg_db.sh}"
+PORG_DEPS="${PORG_DEPS:-${LIBDIR}/porg_deps.py}"
+PORG_BOOTSTRAP="${PORG_BOOTSTRAP:-${BOOTSTRAP_SCRIPT:-${LIBDIR}/porg_bootstrap.sh}}"
+PORG_LOGGER="${PORG_LOGGER:-${LIBDIR}/porg_logger.sh}"
+
+# -------------------- Command Implementations --------------------
+
+cmd_init(){
+  log_info "Initializing PORG directories and defaults"
+  mkdir -p /etc/porg "$LIBDIR" "$PORTS_DIR" "$WORKDIR" "$LOGDIR" "$STATE_DIR" "/var/lib/porg/db"
+  # create default porg.conf if missing
+  if [ ! -f /etc/porg/porg.conf ]; then
+    cat > /etc/porg/porg.conf <<CONF
+# porg.conf minimal
+LIBDIR="$LIBDIR"
+WORKDIR="$WORKDIR"
+LOG_DIR="$LOGDIR"
+STATE_DIR="$STATE_DIR"
+PORTS_DIR="$PORTS_DIR"
+LFS="/mnt/lfs"
+JOBS="\$(nproc)"
+CONF
+    log_info "Created /etc/porg/porg.conf (edit as needed)"
+  else
+    log_info "/etc/porg/porg.conf already exists"
+  fi
+  log_info "Init complete"
+}
+
+cmd_install(){
+  if [ "${#ARGS[@]}" -lt 1 ]; then _die "Use: porg --install <pkg>"; fi
+  local pkgs=("${ARGS[@]}")
+  log_info "Installing packages: ${pkgs[*]}"
+  # resolve deps first
+  if [ -x "$PORG_DEPS" ]; then
+    if [ "$DRY_RUN" = true ]; then
+      log_info "[DRY-RUN] porg_deps resolve ${pkgs[*]}"
+    else
+      log_info "Resolving dependencies via ${PORG_DEPS}"
+      "$PORG_DEPS" resolve "${pkgs[@]}" || log_warn "Dependency resolver returned non-zero"
+    fi
+  fi
+  # Build each package sequentially (mode B = verbose)
+  for pkg in "${pkgs[@]}"; do
+    log_info "Calling builder for $pkg"
+    if [ "$DRY_RUN" = true ]; then
+      log_info "[DRY-RUN] $PORG_BUILDER build $pkg"
+      continue
+    fi
+    if [ -x "$PORG_BUILDER" ]; then
+      "$PORG_BUILDER" build "$pkg"
+      rc=$?
+      if [ $rc -ne 0 ]; then
+        log_error "Builder failed for $pkg (rc=$rc)"
+        if [ "$AUTO_YES" = false ]; then
+          log_info "Stopping due to build failure"
+          return 1
+        else
+          log_warn "Continuing due to --yes"
+        fi
+      else
+        log_info "Builder succeeded for $pkg"
+        # register in DB if available
+        if [ -x "$PORG_DB" ]; then
+          "$PORG_DB" register "$pkg" || log_warn "DB register failed for $pkg"
+        fi
+      fi
+    else
+      log_error "Builder module not found: $PORG_BUILDER"
+      return 2
+    fi
+  done
+  log_info "Install completed for: ${pkgs[*]}"
+}
+
+cmd_remove(){
+  if [ "${#ARGS[@]}" -lt 1 ]; then _die "Use: porg --remove <pkg>"; fi
+  local pkgs=("${ARGS[@]}")
+  log_info "Removing packages: ${pkgs[*]}"
+  for pkg in "${pkgs[@]}"; do
+    if [ "$DRY_RUN" = true ]; then
+      log_info "[DRY-RUN] $PORG_REMOVE $pkg"
+      continue
+    fi
+    if [ -x "$PORG_REMOVE" ]; then
+      "$PORG_REMOVE" "$pkg"
+      rc=$?
+      if [ $rc -ne 0 ]; then
+        log_warn "Remove returned $rc for $pkg"
+      else
+        log_info "Removed $pkg"
+      fi
+    else
+      log_warn "Remove module not found: $PORG_REMOVE"
+      return 2
+    fi
+  done
+}
+
+cmd_upgrade(){
+  # pass-through to upgrader module, respect args
+  log_info "Calling upgrader: ${ARGS[*]:-<world>}"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] $PORG_UPGRADE ${ARGS[*]}"
+    return 0
+  fi
+  if [ -x "$PORG_UPGRADE" ]; then
+    "$PORG_UPGRADE" "${ARGS[@]}"
+    return $?
+  else
+    log_warn "Upgrader module not found: $PORG_UPGRADE"
+    return 2
+  fi
+}
+
+cmd_resolve(){
+  log_info "Running resolver (revdep+depclean)"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] $PORG_RESOLVE --all"
+    return 0
+  fi
+  if [ -x "$PORG_RESOLVE" ]; then
+    "$PORG_RESOLVE" "${ARGS[@]:---all}"
+    return $?
+  else
+    log_warn "Resolver module not found: $PORG_RESOLVE"
+    return 2
+  fi
+}
+
+cmd_audit(){
+  log_info "Running audit"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] $PORG_AUDIT --all"
+    return 0
+  fi
+  if [ -x "$PORG_AUDIT" ]; then
+    "$PORG_AUDIT" "${ARGS[@]:---all}"
+    return $?
+  else
+    log_warn "Audit module not found: $PORG_AUDIT"
+    return 2
+  fi
+}
+
+cmd_sync(){
+  log_info "Syncing ports and metadata"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] git -C $PORTS_DIR pull --ff-only"
+    return 0
+  fi
+  if [ -d "$PORTS_DIR/.git" ] && _have git; then
+    git -C "$PORTS_DIR" pull --ff-only || log_warn "git pull failed"
+  else
+    log_warn "No git repo found at $PORTS_DIR"
+  fi
+  # try deps sync if available
+  if [ -x "$PORG_DEPS" ]; then
+    "$PORG_DEPS" sync || log_warn "deps sync returned non-zero"
+  fi
+}
+
+cmd_db(){
+  if [ -x "$PORG_DB" ]; then
+    "$PORG_DB" "${ARGS[@]}"
+  else
+    log_warn "DB module not found: $PORG_DB"
+    return 2
+  fi
+}
+
+cmd_logs(){
+  local n="${ARGS[0]:-30}"
+  log_info "Showing recent logs (last $n files)"
+  ls -1t "${LOGDIR}"/*.log 2>/dev/null | head -n "$n" | xargs -r -n1 tail -n 200
+}
+
+cmd_search(){
+  local term="${ARGS[0]:-}"
+  if [ -z "$term" ]; then _die "Use: porg --search <term>"; fi
+  log_info "Searching for term: $term in $PORTS_DIR"
+  if _have python3; then
+    python3 - <<PY
+import os,sys
+ports="${PORTS_DIR}"
+t="${term}".lower()
+for root,dirs,files in os.walk(ports):
+    for fn in files:
+        if fn.lower().endswith(('.yaml','.yml')) :
+            p=os.path.join(root,fn)
+            try:
+                import yaml
+                d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
+                name=d.get('name') or fn.rsplit('.',1)[0]
+                desc=d.get('description') or d.get('summary') or ''
+                if t in name.lower() or t in str(desc).lower():
+                    print(f"{name}  - {desc}  ({p})")
+            except Exception:
+                txt=open(p,'r',encoding='utf-8').read().lower()
+                if t in txt:
+                    print(f"{fn.rsplit('.',1)[0]}  - (match in {p})")
+            except BaseException:
+                pass
+PY
+  else
+    grep -RIl --exclude-dir=.git --include='*.ya*ml' "$term" "$PORTS_DIR" 2>/dev/null | sed -n 's#.*/##;s/\..*$//p'
+  fi
+}
+
+cmd_info(){
+  local pkg="${ARGS[0]:-}"
+  if [ -z "$pkg" ]; then _die "Use: porg --info <pkg>"; fi
+  log_info "Showing info for $pkg"
+  # find metafile
+  mf=""
+  mf=$(find "$PORTS_DIR" -type f -iname "*${pkg}*.ya*ml" -print -quit 2>/dev/null || true)
+  if [ -n "$mf" ]; then
+    if _have python3; then
+      python3 - <<PY
+import sys,yaml,json
+p=sys.argv[1]
+try:
+  d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
+  print("Metafile:",p)
+  print("Name:",d.get('name'))
+  print("Version:",d.get('version'))
+  print("Description:",d.get('description') or d.get('summary') or '')
+  print("Dependencies:",d.get('dependencies') or {})
+  print("Source(s):",d.get('source') or '')
+  print("License:",d.get('metadata',{}).get('license',''))
+except Exception as e:
+  print("Unable to parse metafile:",e)
+PY
+"$mf"
+  else
+    log_warn "Metafile not found for $pkg"
+  fi
+  # show installed status from DB if available
+  if [ -x "$PORG_DB" ]; then
+    "$PORG_DB" status "$pkg" || true
+  fi
+  # show checkpoint if exists
+  if [ -f "${STATE_DIR}/${pkg}.state" ]; then
+    echo "Checkpoint:"
+    cat "${STATE_DIR}/${pkg}.state"
+  fi
+}
+
+# -------------------- Graph ASCII --------------------
+graph_ascii_recursive(){
+  local pkg="$1"; local prefix="$2"; local visited="$3"
+  # prevent cycles
+  if grep -qx "$pkg" "$visited" 2>/dev/null; then
+    printf "%s%s (cycle)\n" "$prefix" "$pkg"
+    return
+  fi
+  echo "$pkg" >> "$visited"
+  # try deps.py for deps
+  local deps=()
+  if [ -x "$PORG_DEPS" ]; then
+    mapfile -t deps < <("$PORG_DEPS" graph-deps --pkg "$pkg" --json 2>/dev/null | python3 -c "import sys,json; j=json.load(sys.stdin); print('\\n'.join(j.get('deps',[])))" 2>/dev/null || true)
+  fi
+  # fallback: parse metafile
+  if [ "${#deps[@]}" -eq 0 ]; then
+    mf=$(find "$PORTS_DIR" -type f -iname "*${pkg}*.ya*ml" -print -quit 2>/dev/null || true)
+    if [ -n "$mf" ] && _have python3; then
+      mapfile -t deps < <(python3 - <<PY
+import yaml,sys
+p=sys.argv[1]
+try:
+  d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
+  deps=d.get('dependencies') or d.get('deps') or []
+  out=[]
+  if isinstance(deps, dict):
+    for k,v in deps.items():
+      if isinstance(v,list):
+        out+=v
+  elif isinstance(deps,list):
+    out+=deps
+  elif isinstance(deps,str):
+    out.append(deps)
+  for i in out:
+    print(i)
+except:
+  pass
+PY
+"$mf")
+    fi
+  fi
+  local i=0
+  for d in "${deps[@]}"; do
+    i=$((i+1))
+    if [ $i -eq ${#deps[@]} ]; then
+      printf "%s└─ %s\n" "$prefix" "$d"
+      graph_ascii_recursive "$d" "   ${prefix}" "$visited"
+    else
+      printf "%s├─ %s\n" "$prefix" "$d"
+      graph_ascii_recursive "$d" "│  ${prefix}" "$visited"
+    fi
+  done
+}
+
+cmd_graph(){
+  local pkg="${ARGS[0]:-}"
+  if [ -z "$pkg" ]; then _die "Use: porg --graph <pkg>"; fi
+  log_info "Generating dependency graph for $pkg (ASCII)"
+  visited="${STATE_DIR}/graph-${pkg}.$(_timestamp).visited"
+  : > "$visited"
+  echo "$pkg"
+  graph_ascii_recursive "$pkg" "" "$visited"
+  rm -f "$visited"
+}
+
+# -------------------- Bootstrap integration --------------------
+cmd_bootstrap(){
+  sub="${ARGS[0]:-full}"
+  if [ ! -x "$PORG_BOOTSTRAP" ]; then
+    log_error "Bootstrap module not found: $PORG_BOOTSTRAP"
+    return 2
+  fi
+  case "$sub" in
+    prepare)
+      log_info "Bootstrap: prepare"
+      _call_module_safe "$PORG_BOOTSTRAP" prepare
+      ;;
+    full)
+      log_info "Bootstrap: full (prepare -> build -> enter)"
+      _call_module_safe "$PORG_BOOTSTRAP" full
+      ;;
+    resume)
+      log_info "Bootstrap: resume"
+      _call_module_safe "$PORG_BOOTSTRAP" resume "${ARGS[1]:-}"
+      ;;
+    clean)
+      log_info "Bootstrap: clean (unmount / cleanup)"
+      _call_module_safe "$PORG_BOOTSTRAP" clean
+      ;;
+    enter)
+      log_info "Bootstrap: enter (chroot)"
+      _call_module_safe "$PORG_BOOTSTRAP" enter
+      ;;
+    *)
+      log_warn "Unknown bootstrap subcommand: $sub"
+      echo "Usage: porg --bootstrap [prepare|full|resume|clean|enter]"
+      ;;
+  esac
+}
+
+# -------------------- Dispatch --------------------
+case "$CMD" in
+  --init) cmd_init ;;
+  --install) cmd_install ;;
+  --remove) cmd_remove ;;
+  --upgrade) cmd_upgrade ;;
+  --resolve) cmd_resolve ;;
+  --audit) cmd_audit ;;
+  --sync) cmd_sync ;;
+  --db) cmd_db ;;
+  --logs) cmd_logs ;;
+  --search) cmd_search ;;
+  --info) cmd_info ;;
+  --graph) cmd_graph ;;
+  --bootstrap) cmd_bootstrap ;;
+  --help) usage ;;
+  *) usage ;;
+esac
+
 exit 0
