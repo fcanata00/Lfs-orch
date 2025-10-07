@@ -1,0 +1,69 @@
+# binutils-pass1.yaml
+# Binutils - Pass 1 (LFS-style) - build inside secure chroot (/mnt/lfs)
+# Fonte e comandos baseados em: https://www.linuxfromscratch.org/lfs/view/stable/chapter05/binutils-pass1.html
+
+name: binutils
+version: "2.45"
+stage: pass1
+category: base
+description: "Binutils (pass1) - linker/assembler for initial toolchain"
+license: "GPL-3.0"
+homepage: "https://www.gnu.org/software/binutils/"
+
+# Sources: primary tarball (upstream). Fill sha256 after download/verification.
+source:
+  - url: https://ftp.gnu.org/gnu/binutils/binutils-2.45.tar.xz
+    # sha256: <fill-in-after-download>
+    # To compute the sha256 locally:
+    # curl -L -o binutils-2.45.tar.xz https://ftp.gnu.org/gnu/binutils/binutils-2.45.tar.xz
+    # sha256sum binutils-2.45.tar.xz
+
+# Dependências (build-only here). Many LFS bootstrap packages have minimal deps.
+dependencies:
+  build: []
+  runtime: []
+  optional: []
+
+# Relative build/install directories (all inside WORKDIR used by porg)
+build_dir: binutils-2.45
+destdir: build/binutils-2.45-dest
+
+# Rebuild policy (used by porg to decide when to rebuild)
+rebuild_policy: if-newer
+
+# Graph metadata to help porg --graph
+graph:
+  parent: toolchain
+  children: []
+
+# Hooks (optional scripts executed by porg)
+hooks:
+  pre-build: []
+  post-build: []
+  pre-install: []
+  post-install: []
+
+# Build steps (use porg_builder.sh to interpret these keys)
+build:
+  prepare: |
+    tar -xf ../binutils-2.45.tar.xz
+    cd binutils-2.45
+    mkdir -v build
+    cd build
+  configure: |
+    ../configure --prefix=/tools \
+                 --with-sysroot=$LFS \
+                 --target=$LFS_TGT \
+                 --disable-nls \
+                 --enable-gprofng=no \
+                 --disable-werror \
+                 --enable-new-dtags \
+                 --enable-default-hash-style=gnu
+  compile: |
+    make
+  install: |
+    # install into prefix (note: porg runs this in chroot safe environment)
+    make install
+
+# Notes: this is the standard pass1 binutils configuration from LFS.
+# Run porg with --bootstrap to include this in the toolchain sequence.
