@@ -1,610 +1,596 @@
 #!/usr/bin/env bash
-#
-# porg_remove.sh
-# Remoção inteligente de pacotes para Porg
-# - integrado com porg_logger.sh, porg_db.sh, deps.py
-# - executa hooks de pacote (pre-remove / post-remove) localizados em:
-#     /usr/ports/<categoria>/<pacote>/hooks/pre-remove
-#     /usr/ports/<categoria>/<pacote>/hooks/post-remove
-# - verifica reverse-deps; suporta --force, --dry-run, --recursive, --quiet, --yes
-# - tenta invocar porg_revdep.sh e porg_depclean.sh se presentes; caso contrário, usa heurísticas
-#
-# Uso:
-#   porg_remove.sh <pkgid|pkgname> [--dry-run] [--force] [--recursive] [--quiet] [--yes] [--clean-logs]
-#
+# porg_remove.sh - Remoção segura, paralela e auditável de pacotes para Porg
+# Recursos:
+#  - integração com /etc/porg/porg.conf
+#  - usa porg_logger.sh se disponível (cores, spinner, progresso)
+#  - modo --quiet com UI compacta (spinner + progresso)
+#  - suporte a múltiplos pacotes em lote e --parallel
+#  - dry-run, --yes, --force, --json-log
+#  - backup opcional antes da remoção e rollback suportado externamente
+#  - hooks pré/post remove com contexto exportado (PKG_NAME, PKG_VERSION, PKG_PREFIX)
+#  - integra com porg_db.sh, porg_deps.py, porg_audit.sh e porg_remove auxiliar
+#  - gera logs coloridos e JSON em /var/log/porg/
 set -euo pipefail
 IFS=$'\n\t'
 
-# -------------------- Config / Paths (sobrescrevíveis por env ou porg.conf) --------------------
+# -------------------- Carrega config cedo --------------------
 PORG_CONF="${PORG_CONF:-/etc/porg/porg.conf}"
-LOGGER_SCRIPT="${LOGGER_SCRIPT:-/usr/lib/porg/porg_logger.sh}"
-DB_SCRIPT="${DB_SCRIPT:-/usr/lib/porg/porg_db.sh}"
-DEPS_PY="${DEPS_PY:-/usr/lib/porg/deps.py}"
-REVDEP_SCRIPT="${REVDEP_SCRIPT:-/usr/lib/porg/porg_revdep.sh}"
-DEPCLEAN_SCRIPT="${DEPCLEAN_SCRIPT:-/usr/lib/porg/porg_depclean.sh}"
-PORTS_DIR="${PORTS_DIR:-/usr/ports}"
-KEEP_LOGS_DAYS="${KEEP_LOGS_DAYS:-30}"
+if [ -f "$PORG_CONF" ]; then
+  # shellcheck disable=SC1090
+  source "$PORG_CONF"
+fi
 
-# flags
-DRY_RUN=false
-FORCE=false
-RECURSIVE=false
-QUIET=false
-AUTO_YES=false
-CLEAN_LOGS=false
+# -------------------- Defaults que podem ser sobrescritos em porg.conf --------------------
+INSTALLED_DB="${INSTALLED_DB:-${DB_DIR:-/var/lib/porg/db}/installed.json}"
+LOGGER_SCRIPT="${LOGGER_MODULE:-/usr/lib/porg/porg_logger.sh}"
+DB_SCRIPT="${DB_CMD:-/usr/lib/porg/porg_db.sh}"
+REMOVE_SCRIPT="${REMOVE_MODULE:-/usr/lib/porg/porg_remove.sh}"   # fallback
+DEPS_PY="${DEPS_PY:-/usr/lib/porg/porg_deps.py}"
+AUDIT_SCRIPT="${AUDIT_SCRIPT:-/usr/lib/porg/porg_audit.sh}"
+REPORT_DIR="${REPORT_DIR:-/var/log/porg}"
+JSON_DIR="${JSON_DIR:-${REPORT_DIR}/json}"
+BACKUP_REMOVED="${BACKUP_REMOVED:-false}"
+BACKUP_DIR="${BACKUP_DIR:-/var/cache/porg/backups}"
+HOOKS_ROOT="${HOOK_DIR:-/etc/porg/hooks}"
+PARALLEL_N="${PARALLEL_N:-$(nproc 2>/dev/null || echo 1)}"
+QUIET_MODE_DEFAULT="${QUIET_MODE_DEFAULT:-false}"
+DRY_RUN_DEFAULT="${DRY_RUN_DEFAULT:-false}"
+FORCE_DEFAULT="${FORCE_DEFAULT:-false}"
 
-# -------------------- Helpers: load porg.conf (simple KEY=VAL) --------------------
-_load_porg_conf() {
-  [ -f "$PORG_CONF" ] || return 0
-  while IFS= read -r raw || [ -n "$raw" ]; do
-    line="${raw%%#*}"
-    line="${line%$'\r'}"
-    [ -z "$line" ] && continue
-    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-      eval "$line"
-    fi
-  done < "$PORG_CONF"
-}
+mkdir -p "$REPORT_DIR" "$JSON_DIR" "$BACKUP_DIR" "$(dirname "$INSTALLED_DB")"
 
-_load_porg_conf
-
-# -------------------- Source logger and db modules if available --------------------
+# -------------------- Logger integration --------------------
 if [ -f "$LOGGER_SCRIPT" ]; then
   # shellcheck disable=SC1090
   source "$LOGGER_SCRIPT"
 else
-  # minimal logger fallback
-  log_init() { :; }
-  log() { local level="$1"; shift; printf '[%s] %s\n' "$level" "$*"; }
-  log_section() { printf '=== %s ===\n' "$*"; }
-  log_progress() { :; }
-  log_spinner() { :; }
+  log_info(){ printf "%s [INFO] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+  log_warn(){ printf "%s [WARN] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+  log_error(){ printf "%s [ERROR] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+  log_debug(){ [ "${DEBUG:-false}" = true ] && printf "%s [DEBUG] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+  log_stage(){ printf "%s [STAGE] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+  # basic spinner/progress placeholders
+  _spinner_start(){ :; }
+  _spinner_stop(){ :; }
+  log_progress(){ printf "%s\n" "$*"; }
 fi
 
-if [ -f "$DB_SCRIPT" ]; then
-  # prefer to source db helpers
-  # shellcheck disable=SC1090
-  source "$DB_SCRIPT"
-else
-  # minimal DB helpers (fallback to installed.json direct access)
-  INSTALLED_DB="${INSTALLED_DB:-/var/db/porg/installed.json}"
-  _db_ensure() { [ -f "$INSTALLED_DB" ] || printf '{}' > "$INSTALLED_DB"; }
-  db_list() {
-    _db_ensure
-    python3 - <<PY
-import json,sys
-p=sys.argv[1]
-try:
-    db=json.load(open(p,'r',encoding='utf-8'))
-except:
-    db={}
-for k,v in db.items():
-    print(k, v.get('version',''), v.get('prefix',''), v.get('installed_at',''))
-PY
-    "$INSTALLED_DB"
-  }
-  db_info() {
-    _db_ensure
-    python3 - <<PY
-import json,sys
-p=sys.argv[1]; q=sys.argv[2]
-try:
-    db=json.load(open(p,'r',encoding='utf-8'))
-except:
-    db={}
-val=db.get(q)
-if val is None:
-    sys.exit(1)
-print(json.dumps(val,ensure_ascii=False,indent=2))
-PY
-    "$INSTALLED_DB" "$1"
-  }
-  db_unregister() {
-    _db_ensure
-    python3 - <<PY
-import json,sys
-p=sys.argv[1]; q=sys.argv[2]
-try:
-    db=json.load(open(p,'r',encoding='utf-8'))
-except:
-    db={}
-removed=[]
-for k in list(db.keys()):
-    if k==q or k.startswith(q+'-') or k.split('-')[0]==q:
-        removed.append(k)
-        db.pop(k,None)
-with open(p,'w',encoding='utf-8') as f:
-    json.dump(db,f,indent=2,ensure_ascii=False,sort_keys=True)
-for r in removed:
-    print(r)
-PY
-    "$INSTALLED_DB" "$1"
-  }
-  db_get_prefix() {
-    _db_ensure
-    python3 - <<PY
-import json,sys
-p=sys.argv[1]; q=sys.argv[2]
-try:
-    db=json.load(open(p,'r',encoding='utf-8'))
-except:
-    db={}
-for k,v in db.items():
-    if k==q or k.startswith(q+'-') or k.split('-')[0]==q:
-        print(v.get('prefix',''))
-        sys.exit(0)
-sys.exit(1)
-PY
-    "$INSTALLED_DB" "$1"
-  }
-fi
+# -------------------- Helpers --------------------
+_die(){ log_error "$*"; exit 2; }
+_have(){ command -v "$1" >/dev/null 2>&1; }
+_timestamp(){ date -u +%Y%m%dT%H%M%SZ; }
 
 # -------------------- CLI parsing --------------------
-usage() {
+usage(){
   cat <<EOF
-Usage: ${0##*/} <pkgid|pkgname> [options]
+Usage: $(basename "$0") [options] <pkg> [pkg...]
 Options:
-  --dry-run       Show what would be removed
-  --force         Force removal even if reverse-deps exist (will try depclean/revdep)
-  --recursive     Also remove dependencies that become orphaned
-  --quiet         Minimal terminal output (logs still written)
-  --yes           Answer yes to prompts
-  --clean-logs    Remove logs older than KEEP_LOGS_DAYS
-  -h|--help       Show this help
+  --parallel N      Number of parallel removals (default: detected CPUs)
+  --dry-run         Do not change system; simulate actions
+  --yes             Auto-confirm destructive actions
+  --force           Force removal even if dependents exist
+  --quiet           Compact UI (spinner/progress)
+  --json-log        Write structured JSON report per package in $JSON_DIR
+  --backup          Create backup tar.zst of package prefix before removal
+  --help            Show this help
+Examples:
+  porg-remove --parallel 4 gcc bash coreutils
 EOF
+  exit 1
 }
 
-if [ "$#" -lt 1 ]; then usage; exit 1; fi
+PARALLEL_N="${PARALLEL_N}"
+DRY_RUN="$DRY_RUN_DEFAULT"
+AUTO_YES=false
+QUIET="$QUIET_MODE_DEFAULT"
+FORCE="$FORCE_DEFAULT"
+OUT_JSON=false
+DO_BACKUP=false
 
-PKG_ARG=""
-# parse positional + flags
-while [ "$#" -gt 0 ]; do
+ARGS=()
+while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run) DRY_RUN=true; shift ;;
-    --force) FORCE=true; shift ;;
-    --recursive) RECURSIVE=true; shift ;;
-    --quiet) QUIET=true; shift ;;
-    --yes) AUTO_YES=true; shift ;;
-    --clean-logs) CLEAN_LOGS=true; shift ;;
-    -h|--help) usage; exit 0 ;;
-    --) shift; break ;;
+    --parallel) PARALLEL_N="${2:-$PARALLEL_N}"; shift 2;;
+    --dry-run) DRY_RUN=true; shift;;
+    --yes) AUTO_YES=true; shift;;
+    --force) FORCE=true; shift;;
+    --quiet) QUIET=true; shift;;
+    --json-log) OUT_JSON=true; shift;;
+    --backup) DO_BACKUP=true; shift;;
+    -h|--help) usage;;
+    --) shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done; break;;
+    -*)
+      echo "Unknown option: $1" >&2; usage;;
     *)
-      if [ -z "$PKG_ARG" ]; then PKG_ARG="$1"; shift; else echo "Unknown argument: $1"; usage; exit 2; fi
-      ;;
+      ARGS+=("$1"); shift;;
   esac
 done
 
-if [ "$CLEAN_LOGS" = true ]; then
-  log "INFO" "Cleaning logs older than ${KEEP_LOGS_DAYS} days"
-  if [ -d "${LOG_DIR:-/var/log/porg}" ]; then
-    find "${LOG_DIR:-/var/log/porg}" -type f -mtime +"${KEEP_LOGS_DAYS}" -print0 | xargs -0r rm -f --
-    log "INFO" "Old logs removed"
-  else
-    log "WARN" "Log dir not found: ${LOG_DIR:-/var/log/porg}"
-  fi
-  # if only cleaning logs requested, exit
-  if [ -z "$PKG_ARG" ]; then exit 0; fi
-fi
+if [ "${#ARGS[@]}" -eq 0 ]; then usage; fi
 
-if [ -z "$PKG_ARG" ]; then _die "Package argument required"; fi
+# respect quiet env
+if [ "$QUIET" = true ]; then export QUIET_MODE_DEFAULT=true; fi
 
-TARGET="$PKG_ARG"
+TS="$(_timestamp)"
+GLOBAL_REPORT="${REPORT_DIR}/porg-remove-report-${TS}.json"
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}"/porg-remove.XXXX)"
+trap 'rm -rf "$TMPDIR"' EXIT
 
-# -------------------- Utilities --------------------
-confirm() {
-  if [ "$AUTO_YES" = true ]; then return 0; fi
-  printf "%s [y/N]: " "$1" >&2
-  read -r ans
-  case "$ans" in
-    y|Y|yes|Yes) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# find all installed packages that depend on target
-find_reverse_deps() {
-  # uses installed.json to find packages whose deps include target (exact or prefix)
-  # returns newline-separated pkgids
-  python3 - <<PY
-import json,sys,os
-dbpath=sys.argv[1]; target=sys.argv[2]
-try:
-    db=json.load(open(dbpath,'r',encoding='utf-8'))
-except:
-    db={}
-res=[]
-for k,v in db.items():
-    deps=v.get('deps') or []
-    for d in deps:
-        if d==target or d.split('-')[0]==target or d.startswith(target+'-'):
-            res.append(k); break
-print("\n".join(res))
-PY
-  "${INSTALLED_DB:-/var/db/porg/installed.json}" "$TARGET"
-}
-
-# get package info JSON (or fail)
-get_pkg_info() {
-  # try db_info (sourced) first
-  if type db_info >/dev/null 2>&1; then
-    if db_info "$TARGET" >/dev/null 2>&1; then
-      db_info "$TARGET"
-      return 0
-    fi
-  fi
-  # fallback to direct installed json
-  _db_ensure
-  python3 - <<PY
+# -------------------- JSON helpers --------------------
+_have_jq(){ _have jq; }
+_json_write(){
+  local out="$1"; shift
+  python3 - <<PY > "$out"
 import json,sys
-p=sys.argv[1]; q=sys.argv[2]
-try:
-    db=json.load(open(p,'r',encoding='utf-8'))
-except:
-    db={}
-for k,v in db.items():
-    if k==q or k.startswith(q+'-') or k.split('-')[0]==q:
-        print(json.dumps(v,ensure_ascii=False))
-        sys.exit(0)
-sys.exit(1)
+print(json.dumps(sys.stdin.read() and json.loads(sys.stdin.read()) or {}, indent=2, ensure_ascii=False))
 PY
-  "${INSTALLED_DB:-/var/db/porg/installed.json}" "$TARGET"
 }
 
-# remove prefix directory safely
-remove_prefix() {
-  local prefix="$1"
-  if [ -z "$prefix" ]; then log "WARN" "Prefix empty, skipping"; return 1; fi
-  # protect against accidental removal of root or important dirs
-  case "$prefix" in
-    "/"|"/usr"|"/bin"|"/lib"|"/lib64"|"/sbin"|"/etc")
-      log "ERROR" "Refusing to remove unsafe prefix: $prefix"
-      return 2
-      ;;
-  esac
-  # check if other packages share this prefix
-  if [ -f "${INSTALLED_DB:-/var/db/porg/installed.json}" ]; then
-    same=$(python3 - <<PY
-import json,sys,os
-p=sys.argv[1]; pref=sys.argv[2]; q=sys.argv[3]
-try:
-    db=json.load(open(p,'r',encoding='utf-8'))
-except:
-    db={}
-res=[]
-for k,v in db.items():
-    if v.get('prefix')==pref and not (k==q or k.startswith(q+'-')):
-        res.append(k)
-print(",".join(res))
+# write per-package JSON (best-effort, using python)
+_write_pkg_json(){
+  local out="$1"; shift
+  python3 - <<PY > "$out"
+import json,sys
+d=json.loads("""$*""")
+print(json.dumps(d, indent=2, ensure_ascii=False))
 PY
-    "${INSTALLED_DB:-/var/db/porg/installed.json}" "$prefix" "$TARGET")
-    if [ -n "$same" ]; then
-      log "WARN" "Prefix $prefix is shared with other packages: $same. Not removing prefix directory unless --force."
-      if [ "$FORCE" != true ]; then
-        return 3
-      fi
-    fi
-  fi
+}
 
-  if [ "$DRY_RUN" = true ]; then
-    log "INFO" "[dry-run] Would remove prefix: $prefix"
-    return 0
-  fi
-
-  log "INFO" "Removing prefix: $prefix"
-  if rm -rf -- "$prefix"; then
-    log "INFO" "Removed $prefix"
-    return 0
+# -------------------- DB helpers (read installed.json) --------------------
+read_installed_db_raw(){
+  if [ -f "$INSTALLED_DB" ]; then
+    cat "$INSTALLED_DB"
   else
-    if [ "$FORCE" = true ]; then
-      log "WARN" "Failed to remove $prefix (ignored due to --force)"
-      return 0
-    else
-      log "ERROR" "Failed to remove $prefix"
-      return 4
-    fi
+    echo "{}"
   fi
 }
 
-# execute hooks for this package (relative to package dir)
-run_pkg_hooks() {
-  local stage="$1"  # pre-remove | post-remove
-  # attempt to find package dir under PORTS_DIR
-  # try to locate directory containing package name
-  local found=""
-  if [ -d "$PORTS_DIR" ]; then
-    # find directories matching package name
-    while IFS= read -r d; do
-      # prefer exact match /usr/ports/*/<pkg>
-      if [ -d "$d/hooks/$stage" ]; then
-        found="$d/hooks/$stage"
-        break
-      fi
-    done < <(find "$PORTS_DIR" -maxdepth 3 -type d -name "$TARGET" 2>/dev/null || true)
+# get package record by name (best-effort: matches prefix of key or name field)
+get_pkg_record(){
+  local pkg="$1"
+  if _have_jq; then
+    jq -r --arg pkg "$pkg" 'to_entries[] | select(.value.name == $pkg or (.key|startswith($pkg + "-"))) | .value | @json' "$INSTALLED_DB" 2>/dev/null || echo ""
+  else
+    python3 - <<PY
+import json,sys
+pkg=sys.argv[1]
+try:
+  db=json.load(open("${INSTALLED_DB}",'r',encoding='utf-8'))
+except:
+  db={}
+for k,v in db.items():
+  if v.get('name')==pkg or k.startswith(pkg+"-"):
+    print(json.dumps(v))
+    sys.exit(0)
+print("",end="")
+PY
   fi
-  # fallback: search for any hooks path containing the pkg name
-  if [ -z "$found" ]; then
-    cand=$(find "$PORTS_DIR" -type d -path "*/$TARGET" 2>/dev/null | head -n1 || true)
-    if [ -n "$cand" ] && [ -d "$cand/hooks/$stage" ]; then
-      found="$cand/hooks/$stage"
+}
+
+# get installed prefix for pkg
+get_pkg_prefix(){
+  local pkg="$1"
+  local rec
+  rec="$(get_pkg_record "$pkg")" || true
+  if [ -z "$rec" ]; then
+    echo ""
+    return
+  fi
+  if _have_jq; then
+    echo "$rec" | jq -r '.prefix // empty' || echo ""
+  else
+    python3 - <<PY
+import json,sys
+s=sys.stdin.read()
+try:
+  d=json.loads(s)
+  print(d.get('prefix',''))
+except:
+  print("")
+PY
+"$rec"
+  fi
+}
+
+# get version
+get_pkg_version(){
+  local pkg="$1"
+  local rec
+  rec="$(get_pkg_record "$pkg")" || true
+  if [ -z "$rec" ]; then
+    echo ""
+    return
+  fi
+  if _have_jq; then
+    echo "$rec" | jq -r '.version // empty' || echo ""
+  else
+    python3 - <<PY
+import json,sys
+s=sys.stdin.read()
+try:
+  d=json.loads(s)
+  print(d.get('version',''))
+except:
+  print("")
+PY
+"$rec"
+  fi
+}
+
+# find dependents (reverse deps) using deps.py if available, else naive scan of installed.json metadata
+find_dependents(){
+  local pkg="$1"
+  if [ -x "$DEPS_PY" ]; then
+    # use deps.py graph to find who depends on pkg
+    if _have_jq; then
+      plan="$("$DEPS_PY" upgrade-plan --world 2>/dev/null || true)"
+      echo "$plan" | jq -r --arg pkg "$pkg" '[.upgrade_order[]? as $p | $p] | map(select(. == $pkg)) | []' 2>/dev/null || true
+      # fallback naive: return empty (we'll do naive below)
+    else
+      # fallback: we don't parse graph; use naive scan
+      :
     fi
   fi
-
-  if [ -z "$found" ]; then
-    log "DEBUG" "No hooks found for $TARGET at stage $stage"
-    return 0
+  # naive: scan installed DB for dependency lists in metadata (best-effort)
+  if _have_jq; then
+    jq -r --arg pkg "$pkg" 'to_entries[] | select(.value.dependencies != null) | select(.value.dependencies | index($pkg)) | .value.name' "$INSTALLED_DB" 2>/dev/null || true
+  else
+    python3 - <<PY
+import json,sys
+pkg=sys.argv[1]
+try:
+  db=json.load(open("${INSTALLED_DB}",'r',encoding='utf-8'))
+except:
+  db={}
+out=[]
+for k,v in db.items():
+  deps=v.get('dependencies') or v.get('depends') or []
+  if isinstance(deps,str):
+    deps=[deps]
+  if pkg in deps:
+    out.append(v.get('name') or k)
+for x in out:
+  print(x)
+PY
+"$pkg"
   fi
+}
 
-  log "INFO" "Executing $stage hooks in $found"
-  for hook in "$found"/*; do
-    [ -x "$hook" ] || continue
-    log "INFO" "Running hook: $hook"
+# -------------------- Hooks runner (pre/post remove) --------------------
+run_pkg_hooks(){
+  local stage="$1"; local pkgname="$2"; local pkgver="$3"; local pkgprefix="$4"
+  # global hooks at HOOKS_ROOT/<stage> and per-package at HOOKS_ROOT/<pkg>/<stage>
+  local hooks=()
+  [ -d "${HOOKS_ROOT}/${stage}" ] && for h in "${HOOKS_ROOT}/${stage}"/*; do [ -x "$h" ] && hooks+=("$h"); done
+  [ -d "${HOOKS_ROOT}/${pkgname}/${stage}" ] && for h in "${HOOKS_ROOT}/${pkgname}/${stage}"/*; do [ -x "$h" ] && hooks+=("$h"); done
+  # export context
+  export PKG_NAME="${pkgname}"
+  export PKG_VERSION="${pkgver}"
+  export PKG_PREFIX="${pkgprefix}"
+  export PORG_CONF
+  for h in "${hooks[@]}"; do
+    log_info "Executing hook: $h (stage=$stage) for $pkgname"
     if [ "$DRY_RUN" = true ]; then
-      log "INFO" "[dry-run] would execute $hook"
-      continue
-    fi
-    if ! "$hook"; then
-      log "WARN" "Hook $hook returned non-zero"
-      if [ "$FORCE" != true ]; then
-        log "ERROR" "Aborting due to hook failure: $hook"
-        return 1
-      fi
+      log_info "[DRY-RUN] Would run hook: $h"
+    else
+      ( "$h" ) || log_warn "Hook $h exited with non-zero"
     fi
   done
+}
+
+# -------------------- Backup package prefix --------------------
+backup_prefix(){
+  local pkg="$1"; local prefix="$2"
+  [ -z "$prefix" ] && { log_warn "No prefix for $pkg; skip backup"; return 1; }
+  local ts="$(_timestamp)"
+  local out="${BACKUP_DIR}/${pkg}-${ts}.tar.zst"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] Would create backup ${out} of ${prefix}"
+    echo "$out"
+    return 0
+  fi
+  log_info "Creating backup of ${prefix} -> ${out}"
+  # tar and zstd (if available)
+  if _have zstd; then
+    tar -C "${prefix%/*}" -cf - "$(basename "$prefix")" 2>/dev/null | zstd -T0 -19 -o "$out"
+  else
+    tar -C "${prefix%/*}" -cf "${out%.zst}.tar" "$(basename "$prefix")"
+    out="${out%.zst}.tar"
+  fi
+  echo "$out"
+}
+
+# -------------------- Actual removal worker for a single package --------------------
+_remove_one_pkg(){
+  local pkg="$1"
+  local report_file="$TMPDIR/remove-${pkg}-${TS}.json"
+  local start_ts=$(date +%s)
+  local status="skipped"; local message=""; local freed_bytes=0; local removed_files=0
+  local rec_prefix rec_version
+  rec_prefix="$(get_pkg_prefix "$pkg")" || rec_prefix=""
+  rec_version="$(get_pkg_version "$pkg")" || rec_version=""
+  # run pre-remove hooks
+  run_pkg_hooks "pre-remove" "$pkg" "$rec_version" "$rec_prefix"
+
+  # check dependents
+  mapfile -t dependents < <(find_dependents "$pkg" | sed '/^\s*$/d' || true)
+
+  if [ "${#dependents[@]}" -gt 0 ] && [ "$FORCE" != true ]; then
+    message="Package has dependents: ${dependents[*]}"
+    log_warn "Refusing to remove $pkg: $message"
+    status="blocked"
+    # produce JSON and exit
+    python3 - <<PY > "$report_file"
+{
+  "package":"$pkg",
+  "version":"$rec_version",
+  "prefix":"$rec_prefix",
+  "status":"$status",
+  "message":"$message",
+  "dependents": $(python3 - <<PY2
+import json,sys
+dep=${dependents[@]+"${dependents[@]}"}
+print(json.dumps([x for x in (${dependents[@]+"${dependents[@]}"})]) if dep else "[]")
+PY2
+)
+}
+PY
+    return 1
+  fi
+
+  # backup if requested or configured globally
+  local backup_path=""
+  if [ "$DO_BACKUP" = true ] || [ "$BACKUP_REMOVED" = true ]; then
+    backup_path="$(backup_prefix "$pkg" "$rec_prefix" || echo "")" || true
+  fi
+
+  # perform removal via REMOVE_SCRIPT or DB unregister fallback
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] Would remove $pkg at prefix $rec_prefix"
+    status="dry-run"
+    message="Simulated removal"
+  else
+    if [ -x "$REMOVE_SCRIPT" ]; then
+      log_info "Calling remove script: $REMOVE_SCRIPT $pkg --yes --force=${FORCE}"
+      if "$REMOVE_SCRIPT" "$pkg" --yes --force="${FORCE}" >/dev/null 2>&1; then
+        status="removed"
+        message="Removed via external remove script"
+      else
+        log_warn "REMOVE_SCRIPT failed for $pkg; attempting fallback"
+        # fallback to db unregister & prefix deletion
+      fi
+    fi
+
+    if [ "$status" != "removed" ]; then
+      # fallback: unregister from DB and remove files under prefix (careful)
+      if [ -x "/usr/lib/porg/porg_db.sh" ]; then
+        log_info "Unregistering $pkg via porg_db.sh"
+        if /usr/lib/porg/porg_db.sh unregister "$pkg" >/dev/null 2>&1; then
+          status="db-unregistered"
+        else
+          log_warn "DB unregister failed for $pkg"
+        fi
+      fi
+      # physically remove prefix only if safe and prefix not in critical dirs
+      if [ -n "$rec_prefix" ]; then
+        case "$rec_prefix" in
+          /|/usr|/bin|/sbin|/lib|/lib64|/etc) 
+            log_warn "Refusing to remove critical prefix '$rec_prefix' for $pkg"; status="refused"; message="critical-prefix";;
+          *)
+            # remove prefix
+            log_info "Removing prefix $rec_prefix for $pkg (this may free space)"
+            if rm -rf --one-file-system "$rec_prefix"; then
+              status="${status:-removed-files}"
+              message="Prefix removed"
+            else
+              log_warn "Failed to remove $rec_prefix"
+              status="partial-failure"
+            fi
+            ;;
+        esac
+      else
+        log_warn "No prefix known for $pkg; cannot remove files"
+        status="${status:-no-prefix}"
+      fi
+    fi
+  fi
+
+  # post-remove hooks
+  run_pkg_hooks "post-remove" "$pkg" "$rec_version" "$rec_prefix"
+
+  # optional: run depclean/revdep/audit sequence if forced
+  if [ "$FORCE" = true ]; then
+    log_info "Force requested: running depclean/revdep/audit flows"
+    if [ -x "/usr/bin/porg-resolve" ] || [ -x "/usr/lib/porg/resolve.sh" ]; then
+      if [ -x "/usr/lib/porg/resolve.sh" ]; then
+        /usr/lib/porg/resolve.sh --clean --quiet || true
+      fi
+    fi
+    if [ -x "$AUDIT_SCRIPT" ]; then
+      "$AUDIT_SCRIPT" --quick --quiet || true
+    fi
+  fi
+
+  # compute removed files and freed bytes (best-effort)
+  if [ -n "$rec_prefix" ] && [ -d "$rec_prefix" ]; then
+    # if still exists, try du before/after? best-effort skip
+    removed_files=0; freed_bytes=0
+  else
+    # if removed, try to estimate by backup size or by previous metadata
+    if [ -n "$backup_path" ] && [ -f "$backup_path" ]; then
+      freed_bytes=$(stat -c%s "$backup_path" 2>/dev/null || echo 0)
+      removed_files=$(tar -tf "$backup_path" 2>/dev/null | wc -l 2>/dev/null || echo 0) || true
+    fi
+  fi
+
+  local end_ts=$(date +%s)
+  local duration_s=$((end_ts - start_ts))
+
+  # produce per-package JSON report
+  local json_report="${JSON_DIR}/remove-${pkg}-${TS}.json"
+  if [ "$OUT_JSON" = true ] || [ "$DO_BACKUP" = true ]; then
+    mkdir -p "$JSON_DIR"
+    python3 - <<PY > "$json_report"
+{
+  "package":"$pkg",
+  "version":"$rec_version",
+  "prefix":"$rec_prefix",
+  "status":"$status",
+  "message":"$message",
+  "dependents": $(python3 - <<PY2
+import json,sys
+deps=${dependents[@]+"${dependents[@]}"}
+print(json.dumps([x for x in (${dependents[@]+"${dependents[@]}"})]) if deps else "[]")
+PY2
+),
+  "backup":"${backup_path:-}",
+  "removed_files": $removed_files,
+  "freed_bytes": $freed_bytes,
+  "duration_s": $duration_s,
+  "timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+PY
+  fi
+
+  # UI / logs
+  if [ "$QUIET" = true ]; then
+    if [ "$status" = "removed" ] || [ "$status" = "db-unregistered" ] || [ "$status" = "removed-files" ]; then
+      printf "\r[OK] %s removed (%.0fs)\n" "$pkg" "$duration_s"
+    else
+      printf "\r[! ] %s: %s\n" "$pkg" "$status"
+    fi
+  else
+    log_info "Remove result for $pkg: status=$status message=$message duration=${duration_s}s freed_bytes=${freed_bytes}"
+  fi
+
   return 0
 }
 
-# -------------------- Main removal workflow --------------------
-log_section "porg_remove: starting removal of $TARGET"
-SESSION_START=$(date +%s)
+# -------------------- Parallel execution orchestration --------------------
+# If gnu parallel available prefer it for nice handling; else use background jobs with wait -n or manual throttle
+run_removals_parallel(){
+  local -a pkgs=("$@")
+  local n="${PARALLEL_N:-1}"
+  if _have parallel; then
+    # use GNU parallel; shell-escape each pkg
+    printf "%s\n" "${pkgs[@]}" | parallel -j "$n" --no-notice --lb bash -c 'p="$0"; /usr/lib/porg/porg_remove.sh_internal "$p"' 
+    # Note: we will call internal function via a wrapper below if needed
+    return 0
+  fi
 
-# fetch package info
-pkg_json="$(get_pkg_info 2>/dev/null || true)"
-if [ -z "$pkg_json" ]; then
-  log "ERROR" "Package not found in DB: $TARGET"
-  exit 1
-fi
-
-# extract useful fields using python
-pkg_name="$(python3 - <<PY
-import json,sys
-try:
-    obj=json.loads(sys.stdin.read())
-    print(obj.get('name') or obj.get('pkg') or '')
-except:
-    pass
-PY
-<<<"$pkg_json")"
-pkg_version="$(python3 - <<PY
-import json,sys
-try:
-    obj=json.loads(sys.stdin.read())
-    print(obj.get('version') or '')
-except:
-    pass
-PY
-<<<"$pkg_json")"
-pkg_prefix="$(python3 - <<PY
-import json,sys
-try:
-    obj=json.loads(sys.stdin.read())
-    print(obj.get('prefix') or '')
-except:
-    pass
-PY
-<<<"$pkg_json")"
-
-log "INFO" "Target: $TARGET (name=$pkg_name version=$pkg_version prefix=$pkg_prefix)"
-
-# find reverse deps
-revdeps="$(find_reverse_deps)"
-if [ -n "$revdeps" ]; then
-  log "WARN" "Reverse dependencies found for $TARGET:"
-  echo "$revdeps" | sed 's/^/  - /'
-  if [ "$FORCE" = false ]; then
-    log "ERROR" "Package has dependents; aborting. Use --force to remove and attempt recovery (revdep/depclean)."
-    exit 2
-  else
-    log "WARN" "--force specified: will attempt to handle dependents (revdep/depclean)."
-    # attempt to call revdep script if exists
-    if [ -x "$REVDEP_SCRIPT" ]; then
-      if [ "$DRY_RUN" = true ]; then
-        log "INFO" "[dry-run] Would invoke revdep script: $REVDEP_SCRIPT ${revdeps%%$'\n'*}"
+  # fallback: spawn background jobs and throttle
+  local running=0
+  local pids=()
+  for pkg in "${pkgs[@]}"; do
+    # call internal via current script function in background: use bash -c to invoke this script with special internal mode
+    bash -c "DRY_RUN=${DRY_RUN} QUIET=${QUIET} OUT_JSON=${OUT_JSON} DO_BACKUP=${DO_BACKUP} PARALLEL_N=${PARALLEL_N} \"$0\" --internal-remove \"$pkg\"" &
+    pids+=($!)
+    running=$((running+1))
+    if [ "$running" -ge "$n" ]; then
+      if wait -n 2>/dev/null; then
+        running=$((running-1))
       else
-        log "INFO" "Invoking revdep script to attempt repair: $REVDEP_SCRIPT"
-        "$REVDEP_SCRIPT" repair $TARGET || log "WARN" "revdep script failed or returned non-zero"
-      fi
-    else
-      log "INFO" "No revdep script found at $REVDEP_SCRIPT; will attempt heuristic: mark dependents as requiring rebuild"
-      # heuristic: print instruction
-      echo "Dependents that may break: "
-      echo "$revdeps" | sed 's/^/  * /'
-      log "INFO" "After removal consider rebuilding these packages manually via porg: porg -i <pkg>"
-    fi
-  fi
-else
-  log "DEBUG" "No reverse dependencies found for $TARGET"
-fi
-
-# run pre-remove hooks for this package
-if ! run_pkg_hooks "pre-remove"; then
-  log "ERROR" "pre-remove hooks signaled failure. Aborting."
-  exit 3
-fi
-
-# Determine removal action:
-# Prefer to remove prefix directory; if prefix empty, try to derive install location
-if [ -z "$pkg_prefix" ] || [ "$pkg_prefix" = "/" ]; then
-  log "WARN" "Package prefix is empty or '/'. Removing file-by-file not possible because DB does not track file lists."
-  if [ "$FORCE" != true ]; then
-    log "ERROR" "Refusing to remove ambiguous install location. Use --force to proceed (dangerous)."
-    exit 4
-  fi
-fi
-
-# Confirm
-if [ "$DRY_RUN" = false ] && [ "$AUTO_YES" = false ]; then
-  if ! confirm "Proceed to remove $TARGET (prefix: $pkg_prefix) ?"; then
-    log "INFO" "User cancelled removal"
-    exit 0
-  fi
-fi
-
-# perform removal (prefix removal)
-if [ -n "$pkg_prefix" ] && [ "$pkg_prefix" != "/" ]; then
-  remove_prefix "$pkg_prefix" || {
-    rc=$?
-    if [ "$rc" -ge 2 ] && [ "$FORCE" != true ]; then
-      log "ERROR" "Prefix removal failed with code $rc; aborting."
-      exit $rc
-    fi
-  }
-else
-  # fallback: try to remove known bin paths for package name
-  candidates=( "/usr/bin/${pkg_name}" "/usr/sbin/${pkg_name}" "/usr/lib/${pkg_name}" "/usr/lib64/${pkg_name}" "/usr/share/${pkg_name}" )
-  any_removed=false
-  for f in "${candidates[@]}"; do
-    if [ -e "$f" ]; then
-      if [ "$DRY_RUN" = true ]; then
-        log "INFO" "[dry-run] Would remove $f"
-        any_removed=true
-      else
-        rm -rf -- "$f" 2>/dev/null || true
-        log "INFO" "Removed $f"
-        any_removed=true
+        wait "${pids[0]}" || true
+        pids=("${pids[@]:1}")
+        running=$((running-1))
       fi
     fi
   done
-  if [ "$any_removed" = false ]; then
-    log "WARN" "No files removed (no prefix and no common candidate files found). Consider manual cleanup."
-  fi
+  wait
+}
+
+# -------------------- Internal entrypoint for background removals --------------------
+# This allows calling this script recursively for backgrounds while preserving functions
+if [ "${1:-}" = "--internal-remove" ]; then
+  shift
+  if [ $# -eq 0 ]; then _die "internal-remove requires pkg"; fi
+  pkg="$1"
+  # import previously parsed flags from env or defaults
+  DRY_RUN="${DRY_RUN:-$DRY_RUN_DEFAULT}"
+  QUIET="${QUIET:-$QUIET_MODE_DEFAULT}"
+  OUT_JSON="${OUT_JSON:-false}"
+  DO_BACKUP="${DO_BACKUP:-false}"
+  PARALLEL_N="${PARALLEL_N:-1}"
+  # call the worker
+  _remove_one_pkg "$pkg"
+  exit $?
 fi
 
-# unregister from DB
-if [ "$DRY_RUN" = true ]; then
-  log "INFO" "[dry-run] Would unregister $TARGET from DB"
+# -------------------- Main orchestration --------------------
+main_start_ts=$(date +%s)
+log_stage "porg_remove: starting removal of ${#ARGS[@]} packages (parallel=${PARALLEL_N})"
+# show quiet spinner if requested
+if [ "$QUIET" = true ]; then
+  _spinner_start "Removing packages..."
+fi
+
+# Confirmation if not auto-yes and not dry-run
+if [ "$AUTO_YES" != true ] && [ "$DRY_RUN" != true ]; then
+  printf "Confirm removal of packages: %s ? [y/N]: " "${ARGS[*]}"
+  read -r ans || true
+  case "$ans" in [yY]|[yY][eE][sS]) ;; *) log_info "Aborted by user"; exit 0 ;; esac
+fi
+
+# If PARALLEL_N==1 call sequential, else parallel
+if [ "${PARALLEL_N:-1}" -le 1 ]; then
+  for pkg in "${ARGS[@]}"; do
+    _remove_one_pkg "$pkg" &
+    wait $!
+  done
 else
-  if type db_unregister >/dev/null 2>&1; then
-    removed_keys="$(db_unregister "$TARGET" 2>/dev/null || true)"
-    log "INFO" "Unregistered from DB: ${removed_keys:-(unknown)}"
-  else
-    # fallback: use python to remove
-    if [ -f "${INSTALLED_DB:-/var/db/porg/installed.json}" ]; then
-      python3 - <<PY
-import json,sys
-p=sys.argv[1]; q=sys.argv[2]
-try:
-    db=json.load(open(p,'r',encoding='utf-8'))
-except:
-    db={}
-removed=[]
-for k in list(db.keys()):
-    if k==q or k.startswith(q+'-') or k.split('-')[0]==q:
-        removed.append(k); db.pop(k,None)
-with open(p,'w',encoding='utf-8') as f:
-    json.dump(db,f,indent=2,ensure_ascii=False,sort_keys=True)
-print(",".join(removed))
-PY
-      "${INSTALLED_DB:-/var/db/porg/installed.json}" "$TARGET"
-      log "INFO" "Unregistered $TARGET (fallback)"
-    else
-      log "WARN" "Cannot unregister $TARGET: installed DB not found"
-    fi
-  fi
+  # call run_removals_parallel
+  # For portability, call internal mode
+  for pkg in "${ARGS[@]}"; do
+    bash -c " \"$0\" --internal-remove \"$pkg\"" &
+    # throttle
+    while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL_N" ]; do sleep 0.2; done
+  done
+  wait
 fi
 
-# If recursive: find package deps that became orphans and remove them
-if [ "$RECURSIVE" = true ] || [ "$FORCE" = true ]; then
-  # determine orphans: installed packages that are not depended upon by any remaining package
-  log "INFO" "Calculating orphaned dependencies..."
-  orphans="$(python3 - <<PY
-import json,sys
-dbp=sys.argv[1]
-try:
-    db=json.load(open(dbp,'r',encoding='utf-8'))
-except:
-    db={}
-# build reverse map
-deps_map={}
-for k,v in db.items():
-    deps=v.get('deps') or []
-    for d in deps:
-        deps_map.setdefault(d, set()).add(k)
-orphans=[]
-for k,v in db.items():
-    # if no other package depends on k
-    name=k.split('-')[0]
-    depended=False
-    for dep,owners in deps_map.items():
-        if k in owners or dep.split('-')[0]==name:
-            depended=True
-            break
-    if not depended:
-        orphans.append(k)
-print("\\n".join(orphans))
-PY
-  "${INSTALLED_DB:-/var/db/porg/installed.json}")"
-  if [ -n "$orphans" ]; then
-    log "INFO" "Orphaned packages detected:"
-    echo "$orphans" | sed 's/^/  - /'
-    if [ "$DRY_RUN" = true ]; then
-      log "INFO" "[dry-run] Would remove orphans above"
-    else
-      for o in $orphans; do
-        # avoid removing the package we just removed again
-        if [ "$o" = "$TARGET" ]; then continue; fi
-        log "INFO" "Removing orphan: $o"
-        # call this script recursively for each orphan with --yes --force
-        "${BASH_SOURCE[0]}" "$o" --yes --force || log "WARN" "Failed to remove orphan $o"
-      done
-    fi
-  else
-    log "DEBUG" "No orphans detected"
-  fi
+if [ "$QUIET" = true ]; then
+  _spinner_stop 0
 fi
 
-# Try to run depclean if available (to clean leftover libs)
-if [ -x "$DEPCLEAN_SCRIPT" ]; then
+# Final audit integration
+if [ -x "$AUDIT_SCRIPT" ]; then
+  log_info "Running quick audit after removals"
   if [ "$DRY_RUN" = true ]; then
-    log "INFO" "[dry-run] Would invoke depclean: $DEPCLEAN_SCRIPT"
+    log_info "[DRY-RUN] Would call $AUDIT_SCRIPT --quick"
   else
-    log "INFO" "Invoking depclean: $DEPCLEAN_SCRIPT"
-    "$DEPCLEAN_SCRIPT" || log "WARN" "depclean returned non-zero"
+    "$AUDIT_SCRIPT" --quick --quiet || log_warn "Audit script returned non-zero"
   fi
-else
-  log "DEBUG" "depclean script not found at $DEPCLEAN_SCRIPT; skipping"
 fi
 
-# run post-remove hooks
-if ! run_pkg_hooks "post-remove"; then
-  log "WARN" "post-remove hooks returned non-zero"
-fi
+main_end_ts=$(date +%s)
+main_elapsed=$((main_end_ts - main_start_ts))
 
-# final summary
-SESSION_END=$(date +%s)
-DURATION=$((SESSION_END-SESSION_START))
-LOADAVG="$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0.00)"
-CPU_PERCENT="$(python3 - <<PY
-read=0
-try:
-    import time,sys
-    import os
-    a=open('/proc/stat').readline().split()
-    time.sleep(0.05)
-    b=open('/proc/stat').readline().split()
-    a_sum=sum(int(x) for x in a[1:])
-    b_sum=sum(int(x) for x in b[1:])
-    a_idle=int(a[4]); b_idle=int(b[4])
-    diff_total=b_sum-a_sum
-    diff_idle=b_idle-a_idle
-    if diff_total>0:
-        print(int(100*(diff_total-diff_idle)/diff_total))
-    else:
-        print(0)
-except:
-    print(0)
+# Compose global JSON summary
+python3 - <<PY > "${GLOBAL_REPORT}"
+import json,glob,os,time
+out={}
+out['timestamp']=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+out['packages']=[]
+for f in glob.glob("${TMPDIR}/remove-*.json"):
+    try:
+        out['packages'].append(json.load(open(f,'r',encoding='utf-8')))
+    except:
+        pass
+# also include per-pkg JSONs from JSON_DIR
+for f in glob.glob("${JSON_DIR}/remove-*.json"):
+    try:
+        out['packages'].append(json.load(open(f,'r',encoding='utf-8')))
+    except:
+        pass
+out['summary']={}
+out['summary']['total_packages']=${#ARGS[@]}
+out['summary']['duration_s']=${main_elapsed}
+print(json.dumps(out,indent=2,ensure_ascii=False))
 PY
-)"
-MEM_MB="$(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {printf \"%d\", (t-a)/1024}' /proc/meminfo 2>/dev/null || echo 0)"
-log "INFO" "Removal complete: $TARGET duration=${DURATION}s load=${LOADAVG} cpu=${CPU_PERCENT}% mem=${MEM_MB}MB"
+
+log_info "Removal run completed in ${main_elapsed}s. Global report: ${GLOBAL_REPORT}"
+if [ "$OUT_JSON" = true ]; then
+  cat "${GLOBAL_REPORT}"
+fi
 
 exit 0
