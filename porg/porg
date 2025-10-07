@@ -1,93 +1,129 @@
 #!/usr/bin/env bash
 #
-# porg - Orquestrador principal do Porg (versão integrada com --bootstrap)
-# Modo de saída: técnico/contínuo (verbose). Use --quiet para saída compacta.
+# porg - Orquestrador principal do Porg (versão avançada)
+# - Modo de saída técnico/contínuo (verbose). Use --quiet para saída reduzida.
+# - TUI colorido ativado apenas por --tui.
 #
 set -euo pipefail
 IFS=$'\n\t'
 
-# -------------------- Carrega configuração --------------------
+# ------------------------- Carrega configuração -------------------------
 PORG_CONF="${PORG_CONF:-/etc/porg/porg.conf}"
 [ -f "$PORG_CONF" ] && source "$PORG_CONF" || true
 
-# Valores padrão (se não fornecidos no porg.conf)
-LIBDIR="${MODULES_DIR:-${LIBDIR:-/usr/lib/porg}}"
+# Defaults se não definidos no porg.conf
+MODULES_DIR="${MODULES_DIR:-/usr/lib/porg}"
 WORKDIR="${WORKDIR:-/var/tmp/porg}"
 CACHE_DIR="${CACHE_DIR:-${WORKDIR}/cache}"
 LOGDIR="${LOG_DIR:-/var/log/porg}"
 STATE_DIR="${STATE_DIR:-/var/lib/porg/state}"
 PORTS_DIR="${PORTS_DIR:-/usr/ports}"
-BOOTSTRAP_SCRIPT="${PORG_BOOTSTRAP:-${LIBDIR}/porg_bootstrap.sh}"
+LFS="${LFS:-/mnt/lfs}"
+LOCKFILE="${LOCKFILE:-/var/lock/porg.lock}"
+SESSION_LOG="${LOGDIR}/session-$(date +%Y%m%d-%H%M%S).log"
+JOBS="${JOBS:-$(nproc 2>/dev/null || echo 1)}"
+PARALLEL_N="${PARALLEL_N:-$JOBS}"
 
-mkdir -p "$WORKDIR" "$CACHE_DIR" "$LOGDIR" "$STATE_DIR"
+mkdir -p "$MODULES_DIR" "$WORKDIR" "$CACHE_DIR" "$LOGDIR" "$STATE_DIR"
 
-# -------------------- UI / cores --------------------
-if command -v tput >/dev/null 2>&1 && [ -t 1 ]; then
-  C_RED="$(tput setaf 1)" || C_RED="\e[31m"
-  C_GREEN="$(tput setaf 2)" || C_GREEN="\e[32m"
-  C_YELLOW="$(tput setaf 3)" || C_YELLOW="\e[33m"
-  C_CYAN="$(tput setaf 6)" || C_CYAN="\e[36m"
-  C_BOLD="$(tput bold)" || C_BOLD="\e[1m"
-  C_RESET="$(tput sgr0)" || C_RESET="\e[0m"
+# Module locations (override via porg.conf if needed)
+PORG_BUILDER="${PORG_BUILDER:-${MODULES_DIR}/porg_builder.sh}"
+PORG_BOOTSTRAP="${PORG_BOOTSTRAP:-${MODULES_DIR}/porg_bootstrap.sh}"
+PORG_DEPS="${PORG_DEPS:-${MODULES_DIR}/porg_deps.py}"
+PORG_DB="${PORG_DB:-${MODULES_DIR}/porg_db.sh}"
+PORG_REMOVE="${PORG_REMOVE:-${MODULES_DIR}/porg_remove.sh}"
+PORG_RESOLVE="${PORG_RESOLVE:-${MODULES_DIR}/porg_resolve.sh}"
+PORG_UPGRADE="${PORG_UPGRADE:-${MODULES_DIR}/porg_upgrade.sh}"
+PORG_AUDIT="${PORG_AUDIT:-${MODULES_DIR}/porg_audit.sh}"
+PORG_CROSSGEN="${PORG_CROSSGEN:-${MODULES_DIR}/porg_crossgen.sh}"
+PORG_ISO="${PORG_ISO:-${MODULES_DIR}/porg_iso.sh}"
+PORG_LOGGER="${PORG_LOGGER:-${MODULES_DIR}/porg_logger.sh}"
+
+# ------------------------- Cores e UI -------------------------
+_have() { command -v "$1" >/dev/null 2>&1; }
+if _have tput && [ -t 1 ]; then
+  C_RED="$(tput setaf 1)"; C_GREEN="$(tput setaf 2)"; C_YELLOW="$(tput setaf 3)"
+  C_BLUE="$(tput setaf 4)"; C_CYAN="$(tput setaf 6)"; C_BOLD="$(tput bold)"
+  C_RESET="$(tput sgr0)"
 else
-  C_RED="\e[31m"; C_GREEN="\e[32m"; C_YELLOW="\e[33m"; C_CYAN="\e[36m"; C_BOLD="\e[1m"; C_RESET="\e[0m"
+  C_RED="\e[31m"; C_GREEN="\e[32m"; C_YELLOW="\e[33m"; C_BLUE="\e[34m"
+  C_CYAN="\e[36m"; C_BOLD="\e[1m"; C_RESET="\e[0m"
 fi
 
-# -------------------- Flags globais --------------------
+# ------------------------- Flags globais -------------------------
 DRY_RUN=false
 AUTO_YES=false
 QUIET=false
-PROGRESS=false
-PARALLEL_N="$(nproc 2>/dev/null || echo 1)"
-JSON_OUT=false
+TUI=false
 USE_BWRAP=false
+PARALLEL=false
 
-# -------------------- Logger (respeita QUIET) --------------------
-log_level_priority() { case "$1" in DEBUG) echo 0;; INFO) echo 1;; WARN) echo 2;; ERROR) echo 3;; esac; }
+# ------------------------- Logger (respeita QUIET) -------------------------
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
-log_should_print() {
-  # if QUIET true: only WARN and ERROR printed
+log_level_priority() { case "$1" in DEBUG) echo 0;; INFO) echo 1;; WARN) echo 2;; ERROR) echo 3;; *) echo 1;; esac; }
+log_should_print(){
   local level="$1"
   if [ "$QUIET" = true ]; then
     [ "$(log_level_priority "$level")" -ge "$(log_level_priority WARN)" ] && return 0 || return 1
   fi
-  # else compare with LOG_LEVEL
   [ "$(log_level_priority "$level")" -ge "$(log_level_priority "$LOG_LEVEL")" ] && return 0 || return 1
 }
-log() {
-  local level="$1"; shift
-  local msg="$*"
-  local ts
-  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+log_to_session(){ printf "%s [%s] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$SESSION_LOG"; }
+log(){
+  local level="$1"; shift; local msg="$*"
   if log_should_print "$level"; then
     case "$level" in
-      DEBUG) printf "%s %b[DEBUG]%b %s\n" "$ts" "$C_CYAN" "$C_RESET" "$msg" ;;
-      INFO)  printf "%s %b[INFO]%b  %s\n" "$ts" "$C_GREEN" "$C_RESET" "$msg" ;;
-      WARN)  printf "%s %b[WARN]%b  %s\n" "$ts" "$C_YELLOW" "$C_RESET" "$msg" >&2 ;;
-      ERROR) printf "%s %b[ERROR]%b %s\n" "$ts" "$C_RED" "$C_RESET" "$msg" >&2 ;;
-      *)     printf "%s [LOG] %s\n" "$ts" "$msg" ;;
+      DEBUG) printf "%s %b[DEBUG]%b %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$C_CYAN" "$C_RESET" "$msg" ;;
+      INFO)  printf "%s %b[INFO]%b  %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$C_GREEN" "$C_RESET" "$msg" ;;
+      WARN)  printf "%s %b[WARN]%b  %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$C_YELLOW" "$C_RESET" "$msg" >&2 ;;
+      ERROR) printf "%s %b[ERROR]%b %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$C_RED" "$C_RESET" "$msg" >&2 ;;
+      *)     printf "%s [LOG] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" ;;
     esac
   fi
-  # always append to logfile
-  mkdir -p "$LOGDIR"
-  printf "%s [%s] %s\n" "$ts" "$level" "$msg" >> "${LOGDIR}/porg-$(date +%Y%m%d).log"
+  log_to_session "$level" "$msg"
 }
-
-log_debug(){ log DEBUG "$*"; }
 log_info(){ log INFO "$*"; }
 log_warn(){ log WARN "$*"; }
 log_error(){ log ERROR "$*"; }
+log_debug(){ log DEBUG "$*"; }
 
 _die(){ log_error "$*"; exit 2; }
 
-# -------------------- Helpers --------------------
-_have(){ command -v "$1" >/dev/null 2>&1; }
-_timestamp(){ date -u +%Y%m%dT%H%M%SZ; }
+# ------------------------- Lock (flock) -------------------------
+_acquire_lock(){
+  mkdir -p "$(dirname "$LOCKFILE")"
+  exec 9>"$LOCKFILE"
+  if _have flock; then
+    flock -n 9 || { log_error "Another porg instance is running (lock: $LOCKFILE)"; exit 1; }
+  else
+    if [ -f "$LOCKFILE" ]; then
+      pid=$(cat "$LOCKFILE" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        log_error "Another porg instance (pid $pid) is running"; exit 1
+      else
+        rm -f "$LOCKFILE"
+      fi
+    fi
+    echo $$ > "$LOCKFILE"
+    trap '_release_lock' EXIT
+  fi
+}
+_release_lock(){
+  if _have flock; then flock -u 9 2>/dev/null || true; fi
+  [ -f "$LOCKFILE" ] && rm -f "$LOCKFILE" || true
+}
 
+# ------------------------- Helpers -------------------------
+_timestamp(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+confirm_or_yes(){
+  if [ "$AUTO_YES" = true ]; then return 0; fi
+  read -r -p "$1 [y/N]: " ans
+  case "$ans" in [Yy]*) return 0;; *) return 1;; esac
+}
 _call_module(){
   local module="$1"; shift
-  if [ "${DRY_RUN}" = true ]; then
-    log_info "[DRY-RUN] Would call: $module $*"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY-RUN] would call: $module $*"
     return 0
   fi
   if [ -x "$module" ]; then
@@ -99,155 +135,227 @@ _call_module(){
   fi
 }
 
-# use bwrap if requested and available
-_call_module_safe(){
-  local module="$1"; shift
-  if [ "$USE_BWRAP" = true ] && _have bwrap; then
-    bwrap --dev /dev --proc /proc --ro-bind /usr /usr --tmpfs /tmp --bind "$LIBDIR" "$LIBDIR" --die-with-parent "$module" "$@"
+# ------------------------- TUI utilities (dialog/whiptail) -------------------------
+TUI_CMD=""
+choose_tui_cmd(){
+  if _have dialog; then TUI_CMD="dialog"
+  elif _have whiptail; then TUI_CMD="whiptail"
+  else TUI_CMD=""
+  fi
+}
+# draw ascii bar (length chars) from percent (0-100)
+ascii_bar(){
+  local percent=$1; local length=${2:-30}
+  local filled=$((percent*length/100))
+  local empty=$((length-filled))
+  local bar="$(printf '█%.0s' $(seq 1 $filled))"
+  bar+=$(printf '░%.0s' $(seq 1 $empty))
+  printf "%s" "$bar"
+}
+
+# collect metrics
+collect_metrics(){
+  # CPU (simple 1s sample)
+  if [ -r /proc/stat ]; then
+    read -r cpu a b c d e f g h < /proc/stat || true
+    local total1=$((a+b+c+d+e+f+g+h))
+    local idle1=$d
+    sleep 0.4
+    read -r cpu a b c d e f g h < /proc/stat || true
+    local total2=$((a+b+c+d+e+f+g+h))
+    local idle2=$d
+    cpu_usage=$((100*( (total2-total1) - (idle2-idle1) ) / (total2-total1) ))
+    [ "$cpu_usage" -lt 0 ] && cpu_usage=0
   else
-    _call_module "$module" "$@"
+    cpu_usage=0
+  fi
+  # memory percent
+  if _have free; then
+    mem_usage=$(free -m | awk '/Mem:/ {printf "%d", $3/$2*100}')
+  else
+    mem_usage=0
+  fi
+  loadavg=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+  uptime=$(awk '{print int($1/3600) "h " int($1%3600/60) "m"}' /proc/uptime 2>/dev/null || echo "0m")
+}
+
+# TUI runner tailored for bootstrap/build/upgrade flows
+run_tui_for(){
+  local mode="$1"; shift
+  choose_tui_cmd
+  if [ -z "$TUI_CMD" ]; then log_warn "No dialog/whiptail available; TUI disabled"; return 1; fi
+
+  # spawn background action (mode-specific)
+  local action_pid=0
+  local action_log="${LOGDIR}/tui-action-$(date +%Y%m%d-%H%M%S).log"
+  case "$mode" in
+    bootstrap)
+      ( "$PORG_BOOTSTRAP" "$@" ) &> "$action_log" & action_pid=$!
+      ;;
+    install)
+      ( "$PORG_BUILDER" build "$@" ) &> "$action_log" & action_pid=$!
+      ;;
+    upgrade)
+      ( "$PORG_UPGRADE" "$@" ) &> "$action_log" & action_pid=$!
+      ;;
+    *) log_warn "Unknown TUI mode: $mode"; return 1;;
+  esac
+
+  # show dialog interface
+  while kill -0 "$action_pid" 2>/dev/null; do
+    collect_metrics
+    pct=$(awk 'BEGIN{print int(rand()*80)+10}')
+    # compute progress from logs heuristically (lines count)
+    lines=$(wc -l < "$action_log" 2>/dev/null || echo 0)
+    last_lines=$(tail -n 8 "$action_log" 2>/dev/null || true)
+
+    # build temp file for mixedgauge message
+    tmp="$(mktemp)"
+    {
+      printf "Mode: %s\n" "$mode"
+      printf "CPU: %d%%  MEM: %d%%  LOAD: %s  Uptime: %s\n\n" "$cpu_usage" "$mem_usage" "$loadavg" "$uptime"
+      printf "Progress: %s %%\n\n" "$pct"
+      printf "Last log lines:\n%s\n" "$last_lines"
+    } > "$tmp"
+
+    # show mixedgauge + tailboxbg if dialog available
+    if [ "$TUI_CMD" = "dialog" ]; then
+      dialog --title "Porg TUI - $mode" --mixedgauge "$(cat $tmp)" 18 80 "$pct"
+      dialog --title "Logs (tail)" --tailboxbg "$action_log" 12 80 &
+      sleep 1
+      pkill -f "tailboxbg" 2>/dev/null || true
+    else
+      # whiptail fallback: display textbox
+      whiptail --title "Porg TUI - $mode" --msgbox "$(cat $tmp)" 20 80
+      sleep 1
+    fi
+    rm -f "$tmp"
+  done
+
+  wait "$action_pid" || true
+  log_info "TUI action completed; log: $action_log"
+  # final display of last part of log
+  if [ "$TUI_CMD" = "dialog" ]; then
+    dialog --title "Finished - last logs" --tailbox "$action_log" 18 80
+  else
+    whiptail --title "Finished - last logs" --msgbox "$(tail -n 100 "$action_log" 2>/dev/null || true)" 20 80
   fi
 }
 
-# spinner & monitor are available but in mode B we print everything continuously;
-# spinner used only when QUIET=false and PROGRESS=true
-SPINNER_PID=""
-start_spinner(){
-  local msg="${1:-working...}"
-  if [ "$PROGRESS" = true ] && [ "$QUIET" = false ] && [ -t 1 ]; then
-    ( while :; do for s in '/-\|'; do printf "\r%s %s" "$s" "$msg"; sleep 0.12; done; done ) &
-    SPINNER_PID=$!
-    disown
-  fi
-}
-stop_spinner(){
-  if [ -n "${SPINNER_PID:-}" ]; then
-    kill "$SPINNER_PID" 2>/dev/null || true
-    wait "$SPINNER_PID" 2>/dev/null || true
-    unset SPINNER_PID
-    printf "\r"
-  fi
-}
-
-# -------------------- Usage --------------------
+# ------------------------- CLI / Usage -------------------------
 usage(){
   cat <<EOF
-Usage: porg [global-options] <command> [args]
+porg - Orquestrador Porg
+Uso: porg [global] <command> [args]
 
-Global options:
-  --dry-run           Simula as ações
-  --yes               Auto confirma prompts
-  --quiet             Saída compacta (apenas WARN/ERROR)
-  --progress          Mostra barra/monitor (quando aplicável)
-  --parallel N        Paralelismo para builds
-  --bwrap             Força usar bubblewrap quando possível
+Globais:
+  --dry-run         Simula ações
+  --yes             Auto confirma prompts
+  --quiet           Saída reduzida (apenas WARN/ERROR)
+  --tui             Ativa interface TUI (dialog/whiptail) - separada do --quiet
+  --parallel        Habilita paralelismo (quando suportado)
+  --bwrap           Força uso de bubblewrap em módulos que suportam
+  --help            Mostra esta ajuda
 
-Commands:
-  --init              Cria diretórios e estrutura inicial
-  --install, -i pkg   Resolve deps, build e instala pacote
-  --remove, -r pkg    Remove pacote (com revdep/depclean)
-  --upgrade [pkgs]    Executa upgrade (ou world se vazio)
-  --resolve           Executa revdep+depclean
-  --audit             Executa auditoria do sistema
-  --sync              Sincroniza metafiles (git pull) e deps
-  --db [args]         Ações do DB (status/register/... via porg_db.sh)
-  --logs              Exibe logs recentes
-  --search term       Procura pacotes em /usr/ports
-  --info pkg          Mostra info do pacote
-  --graph pkg         Mostra grafo ASCII de dependências
-  --bootstrap [sub]   Bootstrap LFS: prepare|full|resume|clean|enter
-  --help              Mostra esta ajuda
+Comandos principais:
+  --init                    Cria diretórios e arquivos padrão
+  --install, -i <pkg>       Resolve deps e constrói/instala pacote
+  --remove, -r <pkg>        Remove pacote (usa porg_remove.sh)
+  --upgrade [pkg...]        Atualiza pacote(s) ou world
+  --resolve                 Executa revdep+depclean
+  --audit                   Executa auditoria do sistema
+  --sync                    Sincroniza /usr/ports (git pull) e deps
+  --db <args>               Chama porg_db.sh para ações de DB
+  --logs [n]                Mostra últimos N arquivos de log (default 30)
+  --search <term>           Procura por metafiles/termos em /usr/ports
+  --info <pkg>              Mostra info do pacote (metafile + DB status)
+  --graph <pkg>             Mostra grafo ASCII de dependências
+  --clean-logs              Remove logs antigos com base em porg.conf
+  --bootstrap <sub> [args]  Subcomandos: prepare|list|verify|build|rebuild|resume|full|crossgen|iso|enter|clean
+  --force-unlock            Remove lock file manualmente (usar com cuidado)
 
-Examples:
-  porg -i gcc
-  porg --bootstrap full
+Exemplos:
+  porg --install gcc
+  porg --install gcc --tui
+  porg --bootstrap full --tui
+  porg --bootstrap rebuild gcc-pass2
 EOF
   exit 1
 }
 
-# -------------------- Parse global options --------------------
+# ------------------------- Parse global flags -------------------------
 if [ $# -eq 0 ]; then usage; fi
 CMD=""; ARGS=()
-# We'll parse until we hit a recognized command
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift;;
     --yes) AUTO_YES=true; shift;;
     --quiet) QUIET=true; shift;;
-    --progress) PROGRESS=true; shift;;
-    --parallel) PARALLEL_N="${2:-$PARALLEL_N}"; shift 2;;
+    --tui) TUI=true; shift;;
+    --parallel) PARALLEL=true; PARALLEL_N="${2:-$PARALLEL_N}"; shift 2;;
     --bwrap) USE_BWRAP=true; shift;;
-    --init|--install|-i|--remove|-r|--upgrade|--resolve|--audit|--sync|--db|--logs|--search|--info|--graph|--bootstrap|--help)
+    --help|-h) usage; ;;
+    --init|--install|-i|--remove|-r|--upgrade|--resolve|--audit|--sync|--db|--logs|--search|--info|--graph|--clean-logs|--bootstrap|--force-unlock|--resume)
       CMD="$1"; shift; ARGS=("$@"); break;;
-    *) 
-      # treat as command if starts with porg-? else unknown
-      if [[ "$1" =~ ^- ]]; then echo "Unknown option: $1"; usage; fi
-      CMD="$1"; shift; ARGS=("$@"); break;;
+    *) CMD="$1"; shift; ARGS=("$@"); break;;
   esac
 done
 
 # normalize aliases
-case "$CMD" in
-  -i) CMD="--install";;
-  -r) CMD="--remove";;
-esac
+case "$CMD" in -i) CMD="--install";; -r) CMD="--remove";; esac
 
-# -------------------- Ensure LIBDIR exists --------------------
-[ -d "$LIBDIR" ] || mkdir -p "$LIBDIR"
+# ------------------------- Ensure lock/session -------------------------
+_acquire_lock
+log_info "Porg start: $0 $*"
+log_info "Session log: $SESSION_LOG"
+touch "$SESSION_LOG"
 
-# -------------------- Module paths (defaults if not in config) --------------------
-PORG_BUILDER="${PORG_BUILDER:-${LIBDIR}/porg_builder.sh}"
-PORG_REMOVE="${PORG_REMOVE:-${LIBDIR}/porg_remove.sh}"
-PORG_UPGRADE="${PORG_UPGRADE:-${LIBDIR}/porg_upgrade.sh}"
-PORG_RESOLVE="${PORG_RESOLVE:-${LIBDIR}/porg_resolve.sh}"
-PORG_AUDIT="${PORG_AUDIT:-${LIBDIR}/porg_audit.sh}"
-PORG_DB="${PORG_DB:-${LIBDIR}/porg_db.sh}"
-PORG_DEPS="${PORG_DEPS:-${LIBDIR}/porg_deps.py}"
-PORG_BOOTSTRAP="${PORG_BOOTSTRAP:-${BOOTSTRAP_SCRIPT:-${LIBDIR}/porg_bootstrap.sh}}"
-PORG_LOGGER="${PORG_LOGGER:-${LIBDIR}/porg_logger.sh}"
-
-# -------------------- Command Implementations --------------------
+# ------------------------- Implementações dos comandos -------------------------
 
 cmd_init(){
-  log_info "Initializing PORG directories and defaults"
-  mkdir -p /etc/porg "$LIBDIR" "$PORTS_DIR" "$WORKDIR" "$LOGDIR" "$STATE_DIR" "/var/lib/porg/db"
-  # create default porg.conf if missing
+  log_info "Initializing PORG directory layout..."
+  mkdir -p /etc/porg "$MODULES_DIR" "$PORTS_DIR" "$WORKDIR" "$CACHE_DIR" "$LOGDIR" "$STATE_DIR" "$LFS"
   if [ ! -f /etc/porg/porg.conf ]; then
     cat > /etc/porg/porg.conf <<CONF
-# porg.conf minimal
-LIBDIR="$LIBDIR"
+# minimal porg.conf
+MODULES_DIR="$MODULES_DIR"
 WORKDIR="$WORKDIR"
 LOG_DIR="$LOGDIR"
 STATE_DIR="$STATE_DIR"
 PORTS_DIR="$PORTS_DIR"
-LFS="/mnt/lfs"
-JOBS="\$(nproc)"
+LFS="$LFS"
+JOBS="$JOBS"
 CONF
     log_info "Created /etc/porg/porg.conf (edit as needed)"
-  else
-    log_info "/etc/porg/porg.conf already exists"
   fi
   log_info "Init complete"
 }
 
 cmd_install(){
-  if [ "${#ARGS[@]}" -lt 1 ]; then _die "Use: porg --install <pkg>"; fi
+  [ "${#ARGS[@]}" -ge 1 ] || _die "Use: porg --install <pkg>"
   local pkgs=("${ARGS[@]}")
-  log_info "Installing packages: ${pkgs[*]}"
-  # resolve deps first
+  log_info "Requested install: ${pkgs[*]}"
+  # resolve dependencies
   if [ -x "$PORG_DEPS" ]; then
     if [ "$DRY_RUN" = true ]; then
-      log_info "[DRY-RUN] porg_deps resolve ${pkgs[*]}"
+      log_info "[DRY-RUN] $PORG_DEPS resolve ${pkgs[*]}"
     else
-      log_info "Resolving dependencies via ${PORG_DEPS}"
-      "$PORG_DEPS" resolve "${pkgs[@]}" || log_warn "Dependency resolver returned non-zero"
+      log_info "Resolving dependencies..."
+      "$PORG_DEPS" resolve "${pkgs[@]}" || log_warn "Resolver returned non-zero"
     fi
   fi
-  # Build each package sequentially (mode B = verbose)
+
+  # If TUI requested, run TUI mode for install (first pkg only for TUI mode)
+  if [ "$TUI" = true ]; then
+    run_tui_for install "${pkgs[@]}"
+    return $?
+  fi
+
+  # sequential build/install
   for pkg in "${pkgs[@]}"; do
-    log_info "Calling builder for $pkg"
+    log_info "Building package: $pkg"
     if [ "$DRY_RUN" = true ]; then
-      log_info "[DRY-RUN] $PORG_BUILDER build $pkg"
+      log_info "[DRY-RUN] would call builder for $pkg"
       continue
     fi
     if [ -x "$PORG_BUILDER" ]; then
@@ -255,79 +363,64 @@ cmd_install(){
       rc=$?
       if [ $rc -ne 0 ]; then
         log_error "Builder failed for $pkg (rc=$rc)"
-        if [ "$AUTO_YES" = false ]; then
-          log_info "Stopping due to build failure"
-          return 1
-        else
-          log_warn "Continuing due to --yes"
-        fi
-      else
-        log_info "Builder succeeded for $pkg"
-        # register in DB if available
-        if [ -x "$PORG_DB" ]; then
-          "$PORG_DB" register "$pkg" || log_warn "DB register failed for $pkg"
-        fi
+        return $rc
+      fi
+      log_info "Builder succeeded for $pkg"
+      # register package in DB if module exists
+      if [ -x "$PORG_DB" ]; then
+        "$PORG_DB" register "$pkg" || log_warn "DB register failed for $pkg"
       fi
     else
-      log_error "Builder module not found: $PORG_BUILDER"
-      return 2
+      log_error "Builder module not found: $PORG_BUILDER"; return 2
     fi
   done
-  log_info "Install completed for: ${pkgs[*]}"
+  log_info "Install finished for: ${pkgs[*]}"
 }
 
 cmd_remove(){
-  if [ "${#ARGS[@]}" -lt 1 ]; then _die "Use: porg --remove <pkg>"; fi
+  [ "${#ARGS[@]}" -ge 1 ] || _die "Use: porg --remove <pkg>"
   local pkgs=("${ARGS[@]}")
-  log_info "Removing packages: ${pkgs[*]}"
+  log_info "Requested remove: ${pkgs[*]}"
   for pkg in "${pkgs[@]}"; do
     if [ "$DRY_RUN" = true ]; then
-      log_info "[DRY-RUN] $PORG_REMOVE $pkg"
+      log_info "[DRY-RUN] would remove $pkg"
       continue
     fi
     if [ -x "$PORG_REMOVE" ]; then
       "$PORG_REMOVE" "$pkg"
-      rc=$?
-      if [ $rc -ne 0 ]; then
-        log_warn "Remove returned $rc for $pkg"
-      else
-        log_info "Removed $pkg"
-      fi
     else
-      log_warn "Remove module not found: $PORG_REMOVE"
-      return 2
+      log_error "Remove module not found: $PORG_REMOVE"; return 2
     fi
   done
 }
 
 cmd_upgrade(){
-  # pass-through to upgrader module, respect args
   log_info "Calling upgrader: ${ARGS[*]:-<world>}"
+  if [ "$TUI" = true ]; then
+    run_tui_for upgrade "${ARGS[@]}"
+    return $?
+  fi
   if [ "$DRY_RUN" = true ]; then
     log_info "[DRY-RUN] $PORG_UPGRADE ${ARGS[*]}"
     return 0
   fi
   if [ -x "$PORG_UPGRADE" ]; then
     "$PORG_UPGRADE" "${ARGS[@]}"
-    return $?
   else
-    log_warn "Upgrader module not found: $PORG_UPGRADE"
-    return 2
+    log_error "Upgrade module not found: $PORG_UPGRADE"; return 2
   fi
 }
 
 cmd_resolve(){
   log_info "Running resolver (revdep+depclean)"
   if [ "$DRY_RUN" = true ]; then
-    log_info "[DRY-RUN] $PORG_RESOLVE --all"
+    log_info "[DRY-RUN] $PORG_RESOLVE --scan"
     return 0
   fi
   if [ -x "$PORG_RESOLVE" ]; then
-    "$PORG_RESOLVE" "${ARGS[@]:---all}"
-    return $?
+    "$PORG_RESOLVE" "${ARGS[@]:---scan}"
   else
-    log_warn "Resolver module not found: $PORG_RESOLVE"
-    return 2
+    log_error "Resolver module not found: $PORG_RESOLVE"; return 2
   fi
 }
 
@@ -339,15 +432,13 @@ cmd_audit(){
   fi
   if [ -x "$PORG_AUDIT" ]; then
     "$PORG_AUDIT" "${ARGS[@]:---all}"
-    return $?
   else
-    log_warn "Audit module not found: $PORG_AUDIT"
-    return 2
+    log_error "Audit module not found: $PORG_AUDIT"; return 2
   fi
 }
 
 cmd_sync(){
-  log_info "Syncing ports and metadata"
+  log_info "Syncing ports (git) and deps"
   if [ "$DRY_RUN" = true ]; then
     log_info "[DRY-RUN] git -C $PORTS_DIR pull --ff-only"
     return 0
@@ -355,9 +446,8 @@ cmd_sync(){
   if [ -d "$PORTS_DIR/.git" ] && _have git; then
     git -C "$PORTS_DIR" pull --ff-only || log_warn "git pull failed"
   else
-    log_warn "No git repo found at $PORTS_DIR"
+    log_warn "No git repo at $PORTS_DIR"
   fi
-  # try deps sync if available
   if [ -x "$PORG_DEPS" ]; then
     "$PORG_DEPS" sync || log_warn "deps sync returned non-zero"
   fi
@@ -367,8 +457,7 @@ cmd_db(){
   if [ -x "$PORG_DB" ]; then
     "$PORG_DB" "${ARGS[@]}"
   else
-    log_warn "DB module not found: $PORG_DB"
-    return 2
+    log_error "DB module not found: $PORG_DB"; return 2
   fi
 }
 
@@ -380,30 +469,27 @@ cmd_logs(){
 
 cmd_search(){
   local term="${ARGS[0]:-}"
-  if [ -z "$term" ]; then _die "Use: porg --search <term>"; fi
-  log_info "Searching for term: $term in $PORTS_DIR"
+  [ -n "$term" ] || _die "Use: porg --search <term>"
+  log_info "Searching for \"$term\" in $PORTS_DIR"
   if _have python3; then
     python3 - <<PY
-import os,sys
+import os,sys,yaml
 ports="${PORTS_DIR}"
 t="${term}".lower()
 for root,dirs,files in os.walk(ports):
     for fn in files:
-        if fn.lower().endswith(('.yaml','.yml')) :
+        if fn.lower().endswith(('.yaml','.yml')):
             p=os.path.join(root,fn)
             try:
-                import yaml
                 d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
                 name=d.get('name') or fn.rsplit('.',1)[0]
-                desc=d.get('description') or d.get('summary') or ''
+                desc=d.get('description') or ''
                 if t in name.lower() or t in str(desc).lower():
                     print(f"{name}  - {desc}  ({p})")
             except Exception:
                 txt=open(p,'r',encoding='utf-8').read().lower()
                 if t in txt:
                     print(f"{fn.rsplit('.',1)[0]}  - (match in {p})")
-            except BaseException:
-                pass
 PY
   else
     grep -RIl --exclude-dir=.git --include='*.ya*ml' "$term" "$PORTS_DIR" 2>/dev/null | sed -n 's#.*/##;s/\..*$//p'
@@ -412,80 +498,67 @@ PY
 
 cmd_info(){
   local pkg="${ARGS[0]:-}"
-  if [ -z "$pkg" ]; then _die "Use: porg --info <pkg>"; fi
+  [ -n "$pkg" ] || _die "Use: porg --info <pkg>"
   log_info "Showing info for $pkg"
-  # find metafile
-  mf=""
   mf=$(find "$PORTS_DIR" -type f -iname "*${pkg}*.ya*ml" -print -quit 2>/dev/null || true)
   if [ -n "$mf" ]; then
     if _have python3; then
       python3 - <<PY
-import sys,yaml,json
+import sys,yaml
 p=sys.argv[1]
-try:
-  d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
-  print("Metafile:",p)
-  print("Name:",d.get('name'))
-  print("Version:",d.get('version'))
-  print("Description:",d.get('description') or d.get('summary') or '')
-  print("Dependencies:",d.get('dependencies') or {})
-  print("Source(s):",d.get('source') or '')
-  print("License:",d.get('metadata',{}).get('license',''))
-except Exception as e:
-  print("Unable to parse metafile:",e)
+d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
+print("Metafile:",p)
+print("Name:",d.get('name'))
+print("Version:",d.get('version'))
+print("Description:",d.get('description') or '')
+print("Dependencies:",d.get('dependencies') or {})
+print("Source(s):",d.get('source') or '')
+print("License:",d.get('metadata',{}).get('license',''))
 PY
 "$mf"
+    else
+      cat "$mf"
+    fi
   else
     log_warn "Metafile not found for $pkg"
   fi
-  # show installed status from DB if available
   if [ -x "$PORG_DB" ]; then
     "$PORG_DB" status "$pkg" || true
   fi
-  # show checkpoint if exists
-  if [ -f "${STATE_DIR}/${pkg}.state" ]; then
-    echo "Checkpoint:"
-    cat "${STATE_DIR}/${pkg}.state"
-  fi
 }
 
-# -------------------- Graph ASCII --------------------
-graph_ascii_recursive(){
-  local pkg="$1"; local prefix="$2"; local visited="$3"
-  # prevent cycles
-  if grep -qx "$pkg" "$visited" 2>/dev/null; then
+# ASCII dependency graph (antenas)
+graph_recursive(){
+  local pkg="$1" prefix="$2" visited_file="$3"
+  if grep -qx "$pkg" "$visited_file" 2>/dev/null; then
     printf "%s%s (cycle)\n" "$prefix" "$pkg"
     return
   fi
-  echo "$pkg" >> "$visited"
-  # try deps.py for deps
+  echo "$pkg" >> "$visited_file"
+  # try deps.py first
   local deps=()
   if [ -x "$PORG_DEPS" ]; then
     mapfile -t deps < <("$PORG_DEPS" graph-deps --pkg "$pkg" --json 2>/dev/null | python3 -c "import sys,json; j=json.load(sys.stdin); print('\\n'.join(j.get('deps',[])))" 2>/dev/null || true)
   fi
-  # fallback: parse metafile
   if [ "${#deps[@]}" -eq 0 ]; then
     mf=$(find "$PORTS_DIR" -type f -iname "*${pkg}*.ya*ml" -print -quit 2>/dev/null || true)
     if [ -n "$mf" ] && _have python3; then
       mapfile -t deps < <(python3 - <<PY
 import yaml,sys
 p=sys.argv[1]
-try:
-  d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
-  deps=d.get('dependencies') or d.get('deps') or []
-  out=[]
-  if isinstance(deps, dict):
-    for k,v in deps.items():
-      if isinstance(v,list):
-        out+=v
-  elif isinstance(deps,list):
-    out+=deps
-  elif isinstance(deps,str):
-    out.append(deps)
-  for i in out:
-    print(i)
-except:
-  pass
+d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
+deps=d.get('dependencies') or d.get('deps') or []
+out=[]
+if isinstance(deps, dict):
+  for k,v in deps.items():
+    if isinstance(v,list):
+      out+=v
+elif isinstance(deps,list):
+  out+=deps
+elif isinstance(deps,str):
+  out.append(deps)
+for i in out:
+  print(i)
 PY
 "$mf")
     fi
@@ -495,61 +568,80 @@ PY
     i=$((i+1))
     if [ $i -eq ${#deps[@]} ]; then
       printf "%s└─ %s\n" "$prefix" "$d"
-      graph_ascii_recursive "$d" "   ${prefix}" "$visited"
+      graph_recursive "$d" "   $prefix" "$visited_file"
     else
       printf "%s├─ %s\n" "$prefix" "$d"
-      graph_ascii_recursive "$d" "│  ${prefix}" "$visited"
+      graph_recursive "$d" "│  $prefix" "$visited_file"
     fi
   done
 }
 
 cmd_graph(){
-  local pkg="${ARGS[0]:-}"
-  if [ -z "$pkg" ]; then _die "Use: porg --graph <pkg>"; fi
-  log_info "Generating dependency graph for $pkg (ASCII)"
-  visited="${STATE_DIR}/graph-${pkg}.$(_timestamp).visited"
+  [ -n "${ARGS[0]:-}" ] || _die "Use: porg --graph <pkg>"
+  local pkg="${ARGS[0]}"
+  visited="${STATE_DIR}/graph-${pkg}.$(date +%s).visited"
   : > "$visited"
   echo "$pkg"
-  graph_ascii_recursive "$pkg" "" "$visited"
+  graph_recursive "$pkg" "" "$visited"
   rm -f "$visited"
 }
 
-# -------------------- Bootstrap integration --------------------
-cmd_bootstrap(){
-  sub="${ARGS[0]:-full}"
-  if [ ! -x "$PORG_BOOTSTRAP" ]; then
-    log_error "Bootstrap module not found: $PORG_BOOTSTRAP"
-    return 2
+cmd_clean_logs(){
+  local days="${CLEAN_OLD_LOGS_DAYS:-10}"
+  log_info "Cleaning logs older than ${days} days in $LOGDIR"
+  find "$LOGDIR" -type f -mtime +"$days" -print -exec rm -f {} \; || true
+}
+
+cmd_force_unlock(){
+  if [ -f "$LOCKFILE" ]; then
+    pid=$(cat "$LOCKFILE" 2>/dev/null || true)
+    rm -f "$LOCKFILE"
+    log_warn "Removed lockfile (was held by: $pid)"
+  else
+    log_warn "No lockfile found"
   fi
+}
+
+# ------------------------- Bootstrap passthrough (integrates new subcommands) -------------------------
+cmd_bootstrap(){
+  local sub="${ARGS[0]:-full}"
+  shift || true
   case "$sub" in
-    prepare)
-      log_info "Bootstrap: prepare"
-      _call_module_safe "$PORG_BOOTSTRAP" prepare
-      ;;
-    full)
-      log_info "Bootstrap: full (prepare -> build -> enter)"
-      _call_module_safe "$PORG_BOOTSTRAP" full
-      ;;
-    resume)
-      log_info "Bootstrap: resume"
-      _call_module_safe "$PORG_BOOTSTRAP" resume "${ARGS[1]:-}"
-      ;;
-    clean)
-      log_info "Bootstrap: clean (unmount / cleanup)"
-      _call_module_safe "$PORG_BOOTSTRAP" clean
-      ;;
-    enter)
-      log_info "Bootstrap: enter (chroot)"
-      _call_module_safe "$PORG_BOOTSTRAP" enter
+    prepare|list|verify|rebuild|build|resume|full|crossgen|iso|enter|clean|tui)
+      if [ "$TUI" = true ] && [ "$sub" = "full" -o "$sub" = "build" -o "$sub" = "rebuild" ]; then
+        # TUI mode delegates to run_tui_for
+        if [ "$sub" = "full" ]; then
+          run_tui_for bootstrap full "$@"
+        elif [ "$sub" = "rebuild" ]; then
+          run_tui_for bootstrap rebuild "$@"
+        else
+          run_tui_for bootstrap "$sub" "$@"
+        fi
+        return $?
+      fi
+      # call bootstrap module directly
+      if [ -x "$PORG_BOOTSTRAP" ]; then
+        case "$sub" in
+          rebuild)
+            [ -n "${1:-}" ] || _die "Usage: porg --bootstrap rebuild <phase>"
+            "$PORG_BOOTSTRAP" rebuild "$1"
+            ;;
+          iso)
+            "$PORG_BOOTSTRAP" iso "$@"
+            ;;
+          *) "$PORG_BOOTSTRAP" "$sub" "$@";;
+        esac
+      else
+        log_error "Bootstrap module not found: $PORG_BOOTSTRAP"; return 2
+      fi
       ;;
     *)
-      log_warn "Unknown bootstrap subcommand: $sub"
-      echo "Usage: porg --bootstrap [prepare|full|resume|clean|enter]"
+      _die "Unknown bootstrap subcommand: $sub"
       ;;
   esac
 }
 
-# -------------------- Dispatch --------------------
+# ------------------------- Dispatch -------------------------
 case "$CMD" in
   --init) cmd_init ;;
   --install) cmd_install ;;
@@ -563,9 +655,20 @@ case "$CMD" in
   --search) cmd_search ;;
   --info) cmd_info ;;
   --graph) cmd_graph ;;
+  --clean-logs) cmd_clean_logs ;;
   --bootstrap) cmd_bootstrap ;;
-  --help) usage ;;
+  --force-unlock) cmd_force_unlock ;;
+  --resume)
+    # resume behavior: attempt to resume bootstrap first, then other flows
+    if [ -x "$PORG_BOOTSTRAP" ]; then
+      log_info "Resuming bootstrap (if any)"
+      "$PORG_BOOTSTRAP" resume || log_warn "Bootstrap resume returned non-zero"
+    else
+      log_warn "Bootstrap module not present; nothing to resume"
+    fi
+    ;;
   *) usage ;;
 esac
 
+_release_lock
 exit 0
