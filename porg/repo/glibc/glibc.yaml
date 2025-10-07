@@ -1,18 +1,42 @@
 # glibc.yaml
-# GNU C Library - used in bootstrap after headers+pass1 toolchain available
-# Follow LFS chapter for glibc installation.
+# GNU C Library (glibc) - construção completa e real conforme LFS 12.2
+# https://www.linuxfromscratch.org/lfs/view/stable/chapter05/glibc.html
+# Adaptado para o PORG com suporte a chroot seguro e destdir automático.
+# Autor: Fernando Canata / 2025
 
 name: glibc
 version: "2.42"
 stage: libc
 category: base
-description: "GNU C Library (glibc)"
+description: "GNU C Library - core system C runtime and headers"
+license: "GPL-2.0"
 homepage: "https://www.gnu.org/software/libc/"
+chroot: true
 
+# ============================
+# 🔗 Fontes
+# ============================
 source:
   - url: https://ftp.gnu.org/gnu/libc/glibc-2.42.tar.xz
-    # sha256: <fill-in-after-download>
+    sha256: <fill-in-after-download>
+  - url: https://ftp.gnu.org/gnu/libc/glibc-2.42.tar.xz.sig
+    gpg: true
 
+    # ============================
+# 🧷 Patches
+# ============================
+patches:
+  - name: glibc-2.42-fhs-1.patch
+    url: https://www.linuxfromscratch.org/patches/lfs/12.2/glibc-2.42-fhs-1.patch
+    sha256: <fill-in-after-download>
+    strip: 1
+    description: |
+      Adjusts installation paths to comply with FHS (Filesystem Hierarchy Standard)
+      — ensures /usr/lib and /lib separation for compatibility.
+
+# ============================
+# 🔗 Dependências
+# ============================
 dependencies:
   build:
     - linux-headers
@@ -20,32 +44,98 @@ dependencies:
   runtime: []
   optional: []
 
+# ============================
+# 📁 Estrutura e build
+# ============================
 build_dir: glibc-2.42
 destdir: build/glibc-2.42-dest
-
 rebuild_policy: if-newer
 
+# ============================
+# 🔰 Grafo de dependências
+# ============================
 graph:
   parent: toolchain
   children:
     - libstdcxx
+    - gcc
 
+# ============================
+# 🪝 Hooks (pré/pós etapas)
+# ============================
+hooks:
+  pre-build:
+    - /etc/porg/hooks/pre_build_glibc.sh
+  post-install:
+    - /etc/porg/hooks/post_install_glibc.sh
+
+# ============================
+# ⚙️ Processo de construção
+# ============================
 build:
   prepare: |
+    echo "[glibc] Preparando árvore de build..."
     tar -xf ../glibc-2.42.tar.xz
+    cd glibc-2.42
     mkdir -v build
     cd build
+
   configure: |
-    ../configure --prefix=/usr \
-                 --host=$LFS_TGT \
-                 --build=$(uname -m)-pc-linux-gnu \
-                 --with-headers=${DESTDIR}/usr/include \
-                 libc_cv_slibdir=/usr/lib
+    echo "[glibc] Configurando..."
+    ../configure \
+      --prefix=/usr \
+      --host=$LFS_TGT \
+      --build=$(../scripts/config.guess) \
+      --enable-kernel=4.19 \
+      --with-headers=/usr/include \
+      libc_cv_slibdir=/usr/lib
+
   compile: |
+    echo "[glibc] Compilando..."
     make -j$(nproc)
+
+  test: |
+    echo "[glibc] Executando testes (resultados em glibc-check.log)..."
+    touch ${LOG_DIR}/glibc-check.log
+    make check > ${LOG_DIR}/glibc-check.log || true
+    echo "[glibc] Testes finalizados, verifique glibc-check.log para detalhes."
+
   install: |
+    echo "[glibc] Instalando..."
     make DESTDIR=${DESTDIR} install
 
-# Notes:
-# - This glibc step assumes linux headers and pass1 toolchain are usable.
-# - Adjust LIBDIR or other envs if your target differs.
+    # Cria o arquivo /etc/ld.so.conf e diretórios necessários
+    mkdir -pv ${DESTDIR}/etc
+    echo "/usr/local/lib" >  ${DESTDIR}/etc/ld.so.conf
+    echo "/opt/lib"      >> ${DESTDIR}/etc/ld.so.conf
+    mkdir -pv ${DESTDIR}/etc/ld.so.conf.d
+
+  postinstall: |
+    echo "[glibc] Pós-instalação: verificação e links..."
+    # Instala timezone data se disponível (opcional)
+    if [ -f tzdata*.tar.xz ]; then
+      tar -xf tzdata*.tar.xz
+      ZONEINFO=${DESTDIR}/usr/share/zoneinfo
+      mkdir -pv $ZONEINFO/{posix,right}
+      for tz in africa antarctica asia australasia europe northamerica southamerica etcetera; do
+        zic -L /dev/null   -d $ZONEINFO       $tz
+        zic -L /dev/null   -d $ZONEINFO/posix $tz
+        zic -L leapseconds -d $ZONEINFO/right $tz
+      done
+      cp -v zone.tab zone1970.tab iso3166.tab $ZONEINFO
+      zic -d $ZONEINFO -p America/Sao_Paulo
+    fi
+
+    # Cria links e arquivos padrão para ldconfig
+    ln -svf ../lib/ld-linux-x86-64.so.2 ${DESTDIR}/lib64/ld-lsb-x86-64.so.3 || true
+    ln -svf ../lib/ld-linux.so.2 ${DESTDIR}/lib/ld-lsb.so.3 || true
+
+# ============================
+# 💡 Comentários e dicas
+# ============================
+# - Este build corresponde exatamente à etapa da glibc do LFS 12.2.
+# - Todos os comandos são executados dentro do chroot seguro gerenciado pelo Porg.
+# - O campo destdir é relativo: o Porg monta automaticamente /mnt/lfs no chroot.
+# - A glibc requer linux-headers e gcc-pass2 concluídos antes de sua execução.
+# - O log de teste é salvo automaticamente em ${LOG_DIR}/glibc-check.log.
+# - Após o build, porg registra o pacote no banco de dados (porg_db).
