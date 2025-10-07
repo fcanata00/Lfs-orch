@@ -1,426 +1,401 @@
 #!/usr/bin/env bash
 #
-# porg_bootstrap.sh - Bootstrap LFS via Porg
-# Local sugerido: /usr/lib/porg/porg_bootstrap.sh
-# Uso: sudo porg_bootstrap.sh <prepare|build|enter|resume|clean|full> [opts]
+# porg_bootstrap.sh - Bootstrap LFS (ampliado: list/verify/rebuild/crossgen/tui/iso)
+# Local: /usr/lib/porg/porg_bootstrap.sh
+#
+# Uso:
+#   sudo porg_bootstrap.sh prepare
+#   sudo porg_bootstrap.sh list
+#   sudo porg_bootstrap.sh verify
+#   sudo porg_bootstrap.sh rebuild <fase>
+#   sudo porg_bootstrap.sh crossgen
+#   sudo porg_bootstrap.sh full [--tui]
+#   sudo porg_bootstrap.sh build [--dry]
+#   sudo porg_bootstrap.sh resume
+#   sudo porg_bootstrap.sh enter
+#   sudo porg_bootstrap.sh iso [--output /path/to.iso] [--label LABEL]
+#   sudo porg_bootstrap.sh clean
 #
 set -euo pipefail
 IFS=$'\n\t'
 
-# -------------------- Configuração e caminhos --------------------
+# -------------------- Configuração (carrega /etc/porg/porg.conf se houver) --------------------
 PORG_CONF="${PORG_CONF:-/etc/porg/porg.conf}"
-[ -f "$PORG_CONF" ] && source "$PORG_CONF"
+[ -f "$PORG_CONF" ] && source "$PORG_CONF" || true
 
-# Variáveis padrão (podem ser sobrescritas em porg.conf)
-LFS="${LFS:-/mnt/lfs}"
-LFS_SOURCES_DIR="${LFS_SOURCES_DIR:-${LFS}/sources}"
-LFS_TOOLS_DIR="${LFS_TOOLS_DIR:-${LFS}/tools}"
-LFS_USER="${LFS_USER:-lfs}"
-LFS_TGT="${LFS_TGT:-x86_64-lfs-linux-gnu}"
-LFS_JOBS="${LFS_JOBS:-$(nproc 2>/dev/null || echo 1)}"
-
+# Padrões
 LIBDIR="${LIBDIR:-/usr/lib/porg}"
-BUILDER="${BUILDER:-${LIBDIR}/porg_builder.sh}"
-STATE_DIR="${STATE_DIR:-/var/lib/porg/state}"
-BOOTSTRAP_STATE="${STATE_DIR}/bootstrap.state"
+BUILDER="${PORG_BUILDER:-${LIBDIR}/porg_builder.sh}"
+CROSSGEN="${PORG_CROSSGEN:-${LIBDIR}/porg_crossgen.sh}"
+ISO_TOOL="${PORG_ISO:-${LIBDIR}/porg_iso.sh}"
+BOOTSTRAP_YAML="${BOOTSTRAP_YAML:-/usr/ports/bootstrap.yaml}"
+LFS="${LFS:-/mnt/lfs}"
+LFS_USER="${LFS_USER:-lfs}"
+STATE_BASE="${STATE_DIR:-/var/lib/porg/state}/bootstrap"
 LOGDIR="${LOGDIR:-/var/log/porg/bootstrap}"
 LOCKFILE="${LOCKFILE:-/var/lock/porg-bootstrap.lock}"
-BOOTSTRAP_YAML="${BOOTSTRAP_YAML:-/usr/ports/bootstrap.yaml}"
+JOBS="${JOBS:-$(nproc 2>/dev/null || echo 1)}"
 
-mkdir -p "$STATE_DIR" "$LOGDIR" "$(dirname "$LOCKFILE")"
+mkdir -p "$STATE_BASE" "$LOGDIR" "$(dirname "$LOCKFILE")"
 
-# -------------------- UI / logger fallback --------------------
-if [ -f "${LIBDIR}/porg_logger.sh" ]; then
-  # shellcheck disable=SC1090
-  source "${LIBDIR}/porg_logger.sh" || true
+# -------------------- Utilitários e cores --------------------
+_have(){ command -v "$1" >/dev/null 2>&1; }
+_timestamp(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+if _have tput && [ -t 1 ]; then
+  R=$(tput setaf 1); G=$(tput setaf 2); Y=$(tput setaf 3); C=$(tput setaf 6); B=$(tput bold); N=$(tput sgr0)
 else
-  log_info(){ printf "%s [INFO] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
-  log_warn(){ printf "%s [WARN] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
-  log_error(){ printf "%s [ERROR] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
-  log_stage(){ printf "%s [STAGE] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+  R="\e[31m"; G="\e[32m"; Y="\e[33m"; C="\e[36m"; B="\e[1m"; N="\e[0m"
 fi
 
-# -------------------- Helpers --------------------
-_have(){ command -v "$1" >/dev/null 2>&1; }
-_timestamp(){ date -u +%Y%m%dT%H%M%SZ; }
+log(){ local lvl="$1"; shift; printf "%s [%s] %b%s%b\n" "$(_timestamp)" "$lvl" "${C}" "$*" "${N}"; printf "%s [%s] %s\n" "$(_timestamp)" "$lvl" "$*" >> "${LOGDIR}/bootstrap-$(date +%Y%m%d).log"; }
+log_info(){ log INFO "$*"; }
+log_warn(){ log WARN "$*"; }
+log_error(){ log ERROR "$*"; }
 _die(){ log_error "$*"; exit 2; }
 
-# Acquire lock (flock if available) to avoid concurrent bootstraps
+# -------------------- Lock (flock if available) --------------------
 _acquire_lock(){
   exec 201>"$LOCKFILE"
   if _have flock; then
-    flock -n 201 || { log_error "Another bootstrap is running (lockfile $LOCKFILE)."; exit 1; }
+    flock -n 201 || { log_error "Another bootstrap is running (lock ${LOCKFILE})."; exit 1; }
   else
     if [ -f "$LOCKFILE" ]; then
       pid=$(cat "$LOCKFILE" 2>/dev/null || true)
       if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        log_error "Another bootstrap (pid $pid) is running. Aborting."
-        exit 1
+        log_error "Another bootstrap seems to be running (pid $pid)."; exit 1
       else
-        log_warn "Stale lockfile found; removing."
         rm -f "$LOCKFILE"
       fi
     fi
     echo $$ > "$LOCKFILE"
     trap '_release_lock' EXIT
   fi
-  # register cleanup
-  trap 'umount_lfs_on_exit' INT TERM EXIT
 }
+_release_lock(){ if _have flock; then flock -u 201 2>/dev/null || true; fi; [ -f "$LOCKFILE" ] && rm -f "$LOCKFILE" || true; }
 
-_release_lock(){
-  if _have flock; then
-    flock -u 201 2>/dev/null || true
-  fi
-  [ -f "$LOCKFILE" ] && rm -f "$LOCKFILE" || true
-}
-
-# ensure we are root for mount/umount/useradd operations
-_require_root(){
-  if [ "$(id -u)" -ne 0 ]; then
-    _die "This script must be run as root (sudo)."
-  fi
-}
-
-# -------------------- Mount /mnt/lfs safely --------------------
-is_mounted(){
-  local target="$1"
-  mountpoint -q "$target"
-}
-
-mount_lfs(){
-  _require_root
-  log_stage "Preparando montagem em ${LFS}"
-  mkdir -p "${LFS}" "${LFS_SOURCES_DIR}" "${LFS_TOOLS_DIR}" "${LFS}/dev" "${LFS}/proc" "${LFS}/sys" "${LFS}/run" "${LFS}/root" "${LFS}/etc"
-  if is_mounted "$LFS"; then
-    log_warn "${LFS} já está montado."
-    return 0
-  fi
-
-  log_info "Bind /dev -> ${LFS}/dev"
-  mount --bind /dev "${LFS}/dev"
-  log_info "Bind /run -> ${LFS}/run"
-  mount --bind /run "${LFS}/run"
-  log_info "Mount proc -> ${LFS}/proc"
-  mount -t proc proc "${LFS}/proc"
-  log_info "Mount sysfs -> ${LFS}/sys"
-  mount -t sysfs sysfs "${LFS}/sys"
-  log_info "Mount devpts -> ${LFS}/dev/pts"
-  mount -t devpts devpts "${LFS}/dev/pts" -o gid=5,mode=620
-
-  # Ensure /etc exists inside chroot and copy resolv.conf for network inside chroot
-  mkdir -p "${LFS}/etc"
-  if [ -f /etc/resolv.conf ]; then
-    cp -a /etc/resolv.conf "${LFS}/etc/resolv.conf"
-    log_info "Cópia de /etc/resolv.conf para ${LFS}/etc/resolv.conf"
-  fi
-
-  log_info "Montagem concluída."
-}
-
-# Unmount in safe reverse order; ignore failures but warn
-umount_lfs(){
-  _require_root
-  log_stage "Desmontando ${LFS} (ordem reversa segura)"
-  local targets=( "${LFS}/dev/pts" "${LFS}/dev" "${LFS}/proc" "${LFS}/sys" "${LFS}/run" )
-  for t in "${targets[@]}"; do
-    if mountpoint -q "$t"; then
-      log_info "Umount $t"
-      if ! umount -l "$t" 2>/dev/null; then
-        log_warn "umount -l falhou para $t; tentando forçar depois"
-        umount -f "$t" 2>/dev/null || log_warn "Falha ao desmontar $t"
-      fi
-    fi
-  done
-  log_info "Desmontagem concluída (se não houver processos presos)."
-}
-
-# helper used in trap to ensure unmount attempt
-umount_lfs_on_exit(){
-  # only when script exits do we try to unmount if we mounted
-  if is_mounted "${LFS}/proc" || is_mounted "${LFS}/dev"; then
-    log_warn "Tentando desmontar LFS na saída..."
-    umount_lfs || true
-  fi
-}
-
-# -------------------- Create LFS user and permissions --------------------
-create_lfs_user(){
-  _require_root
-  if id "${LFS_USER}" >/dev/null 2>&1; then
-    log_info "Usuário ${LFS_USER} já existe"
-  else
-    log_info "Criando usuário ${LFS_USER}"
-    useradd -m -s /bin/bash "${LFS_USER}" || _die "Falha ao criar usuário ${LFS_USER}"
-  fi
-  mkdir -p "${LFS_SOURCES_DIR}" "${LFS_TOOLS_DIR}"
-  chown -R "${LFS_USER}:${LFS_USER}" "${LFS_SOURCES_DIR}" "${LFS_TOOLS_DIR}"
-  chmod a+wt "${LFS_SOURCES_DIR}" || true
-  log_info "Permissões ajustadas em ${LFS_SOURCES_DIR} e ${LFS_TOOLS_DIR}"
-}
-
-# -------------------- Bootstrap list parser --------------------
+# -------------------- YAML parsing helper (lista fases) --------------------
 get_bootstrap_list(){
-  # Return list via stdout, one per line
-  if [ -f "$BOOTSTRAP_YAML" ]; then
-    if _have python3; then
-      # prefer PyYAML; fallback to naive parsing in python
-      python3 - <<PY
-import sys,os
+  if [ ! -f "$BOOTSTRAP_YAML" ]; then
+    log_error "bootstrap.yaml not found at $BOOTSTRAP_YAML"; return 1
+  fi
+  if _have python3; then
+    python3 - <<PY
+import yaml,sys,os
 p=os.path.expanduser("$BOOTSTRAP_YAML")
 try:
-    import yaml
-    d=yaml.safe_load(open(p,'r',encoding='utf-8'))
+    d=yaml.safe_load(open(p,'r',encoding='utf-8')) or {}
     seq=d.get('bootstrap') or d.get('bootstrap_list') or []
     if isinstance(seq, list):
-        for item in seq:
-            print(item)
+        for it in seq:
+            print(it)
     else:
-        # fallback string lines
+        # fallback printing
         for line in str(seq).splitlines():
-            line=line.strip().lstrip('-').strip()
-            if line: print(line)
-except Exception:
-    # naive parser: find lines after 'bootstrap:' with '- item'
-    out=[]
+            v=line.strip().lstrip('-').strip()
+            if v: print(v)
+except Exception as e:
+    # fallback to grep
+    import re
     with open(p,'r',encoding='utf-8') as f:
-        started=False
         for l in f:
-            if not started and l.strip().startswith('bootstrap'):
-                started=True
-                continue
-            if started:
-                s=l.strip()
-                if not s: break
-                if s.startswith('-'):
-                    print(s.lstrip('-').strip())
+            m=re.match(r'^\s*-\s*(.+)',l)
+            if m: print(m.group(1).strip())
 PY
-      return 0
+  else
+    # fallback grep/sed
+    grep -E '^\s*-\s+' "$BOOTSTRAP_YAML" | sed -E 's/^\s*-\s*//' || true
+  fi
+}
+
+# -------------------- Checkpoint helpers --------------------
+state_file_for(){ local pkg="$1"; echo "${STATE_BASE}/${pkg}.state"; }
+save_state(){
+  local pkg="$1"; local status="${2:-unknown}"; local extra="${3:-}"
+  mkdir -p "$STATE_BASE"
+  cat > "$(state_file_for "$pkg")" <<EOF
+name: "$pkg"
+status: "$status"
+extra: "$extra"
+ts: "$(_timestamp)"
+EOF
+}
+load_state(){
+  local pkg="$1"; if [ -f "$(state_file_for "$pkg")" ]; then cat "$(state_file_for "$pkg")"; else echo ""; fi
+}
+status_of(){
+  local pkg="$1"
+  if [ -f "$(state_file_for "$pkg")" ]; then
+    awk -F': ' '/status:/{gsub(/"/,"",$2); print $2; exit}' "$(state_file_for "$pkg")"
+  else
+    echo "PENDING"
+  fi
+}
+
+# -------------------- Comando: list --------------------
+cmd_list(){
+  log_info "Listing bootstrap phases from $BOOTSTRAP_YAML"
+  local i=0
+  mapfile -t arr < <(get_bootstrap_list || true)
+  for pkg in "${arr[@]}"; do
+    st=$(status_of "$pkg")
+    case "$st" in
+      success|rebuilt) icon="[${G}✔${N}]" ;;
+      building|rebuilding) icon="[${Y}~${N}]" ;;
+      failed) icon="[${R}✗${N}]" ;;
+      *) icon="[ ]" ;;
+    esac
+    printf "%3d %s %s\n" $((i+1)) "$icon" "$pkg"
+    i=$((i+1))
+  done
+}
+
+# -------------------- Comando: verify --------------------
+cmd_verify(){
+  log_info "Verifying bootstrap checkpoints integrity..."
+  local ok=0 bad=0
+  mapfile -t arr < <(get_bootstrap_list || true)
+  for pkg in "${arr[@]}"; do
+    sf="$(state_file_for "$pkg")"
+    if [ ! -f "$sf" ]; then
+      printf "[%s] %s - missing state\n" "MISSING" "$pkg"
+      bad=$((bad+1))
+      continue
+    fi
+    st=$(status_of "$pkg")
+    if [ "$st" = "success" ] || [ "$st" = "rebuilt" ]; then
+      printf "[OK] %s\n" "$pkg"
+      ok=$((ok+1))
     else
-      # fallback to grep-based parse
-      grep -E '^\s*-\s+' "$BOOTSTRAP_YAML" | sed -E 's/^\s*-\s*//' || true
+      printf "[WARN] %s (status=%s)\n" "$pkg" "$st"
+      bad=$((bad+1))
+    fi
+  done
+  log_info "Verify: OK=${ok} WARN/ERR=${bad}"
+  if [ $bad -gt 0 ]; then return 1; else return 0; fi
+}
+
+# -------------------- Comando: rebuild <fase> --------------------
+cmd_rebuild(){
+  local phase="$1"
+  if [ -z "$phase" ]; then _die "Usage: $0 rebuild <fase>"; fi
+  if [ ! -x "$BUILDER" ]; then _die "Builder module not found: $BUILDER"; fi
+  log_info "Rebuilding phase: $phase"
+  save_state "$phase" "rebuilding"
+  logfile="${LOGDIR}/${phase}.$(date +%Y%m%d%H%M%S).log"
+  mkdir -p "$(dirname "$logfile")"
+  if id "$LFS_USER" >/dev/null 2>&1; then
+    if ! sudo -E -u "$LFS_USER" "$BUILDER" build "$phase" >>"$logfile" 2>&1; then
+      save_state "$phase" "failed" "$logfile"
+      log_error "Rebuild failed for $phase. See $logfile"
+      return 1
     fi
   else
-    log_warn "bootstrap.yaml não encontrado em $BOOTSTRAP_YAML"
-    return 1
+    if ! "$BUILDER" build "$phase" >>"$logfile" 2>&1; then
+      save_state "$phase" "failed" "$logfile"
+      log_error "Rebuild failed for $phase. See $logfile"
+      return 1
+    fi
   fi
+  save_state "$phase" "rebuilt" "$logfile"
+  log_info "Rebuild succeeded for $phase"
+  return 0
 }
 
-# -------------------- State (checkpoints/resume) --------------------
-save_bootstrap_state(){
-  # accepts index and current package name
-  local idx="$1"; local pkg="$2"
-  cat > "$BOOTSTRAP_STATE" <<JSON
-{"index": ${idx}, "package":"${pkg}", "ts":"$(_timestamp)"}
-JSON
-  log_info "Checkpoint salvo: index=${idx} package=${pkg}"
-}
-
-load_bootstrap_state(){
-  if [ -f "$BOOTSTRAP_STATE" ]; then
-    cat "$BOOTSTRAP_STATE"
-  else
-    echo "{}"
-  fi
-}
-
-clear_bootstrap_state(){
-  [ -f "$BOOTSTRAP_STATE" ] && rm -f "$BOOTSTRAP_STATE"
-  log_info "Checkpoint removido"
-}
-
-# -------------------- Build toolchain (usa porg_builder.sh) --------------------
-build_toolchain(){
-  _require_root
+# -------------------- Comando: build (sequencial com resume) --------------------
+cmd_build(){
   local dry="${1:-false}"
-  local idx=0
-  # read array of packages
-  mapfile -t pkgs < <(get_bootstrap_list || true)
-  if [ "${#pkgs[@]}" -eq 0 ]; then
-    _die "Lista bootstrap vazia; verifique $BOOTSTRAP_YAML"
-  fi
-
-  # resume if state exists
-  if [ -f "$BOOTSTRAP_STATE" ]; then
-    cur_json="$(load_bootstrap_state)"
-    idx=$(python3 - <<PY
-import json,sys
-try:
-  d=json.load(open("$BOOTSTRAP_STATE",'r'))
-  print(int(d.get('index',0)))
-except:
-  print(0)
-PY
-)
-    log_info "Resuming from index $idx"
-  fi
-
-  local total=${#pkgs[@]}
-  for (( i=idx; i<total; i++ )); do
-    pkg="${pkgs[i]}"
-    save_bootstrap_state "$i" "$pkg"
-    log_stage "[$((i+1))/$total] Construindo toolchain: $pkg"
-    # invoke builder as LFS user, with env vars so builder knows we're bootstrapping
-    export LFS DESTDIR LFS_TGT LFS_JOBS
-    DESTDIR="${LFS}" # builder may respect DESTDIR env
-    if [ "$dry" = "true" ]; then
-      log_info "[DRY-RUN] sudo -u ${LFS_USER} ${BUILDER} build ${pkg}"
+  mapfile -t arr < <(get_bootstrap_list || true)
+  local total=${#arr[@]}
+  if [ $total -eq 0 ]; then _die "bootstrap list empty"; fi
+  # find first not-success (resume)
+  local start=0
+  for idx in "${!arr[@]}"; do
+    pkg="${arr[$idx]}"
+    st=$(status_of "$pkg")
+    if [ "$st" = "success" ] || [ "$st" = "rebuilt" ]; then
+      start=$((start+1))
+      continue
     else
-      if id "${LFS_USER}" >/dev/null 2>&1; then
-        # Prefer to run as lfs user to reduce permission problems inside build
-        log_info "Chamando builder para $pkg (como ${LFS_USER})"
-        if ! sudo -E -u "${LFS_USER}" "${BUILDER}" build "${pkg}"; then
-          log_error "Builder falhou para ${pkg}. Verifique logs em ${LOGDIR}."
-          return 1
+      break
+    fi
+  done
+  for ((i=start;i<total;i++)); do
+    pkg="${arr[$i]}"
+    log_info "[$((i+1))/$total] Building $pkg"
+    save_state "$pkg" "building"
+    logfile="${LOGDIR}/${pkg}.$(date +%Y%m%d%H%M%S).log"
+    mkdir -p "$(dirname "$logfile")"
+    if [ "$dry" = "true" ]; then
+      log_info "[DRY-RUN] would build $pkg"
+      save_state "$pkg" "success" "$logfile"
+      continue
+    fi
+    if [ -x "$BUILDER" ]; then
+      if id "$LFS_USER" >/dev/null 2>&1; then
+        if ! sudo -E -u "$LFS_USER" "$BUILDER" build "$pkg" >>"$logfile" 2>&1; then
+          save_state "$pkg" "failed" "$logfile"
+          log_error "Build failed for $pkg (see $logfile)"; return 1
         fi
       else
-        # fallback to running as root (menos seguro)
-        if ! "${BUILDER}" build "${pkg}"; then
-          log_error "Builder falhou para ${pkg}. Verifique logs em ${LOGDIR}."
-          return 1
+        if ! "$BUILDER" build "$pkg" >>"$logfile" 2>&1; then
+          save_state "$pkg" "failed" "$logfile"
+          log_error "Build failed for $pkg (see $logfile)"; return 1
         fi
       fi
+      save_state "$pkg" "success" "$logfile"
+      log_info "Built $pkg"
+    else
+      _die "Builder not executable: $BUILDER"
     fi
-    # small sync + sleep to stabilize mounts & disk
-    sync
-    sleep 1
   done
-
-  log_stage "Toolchain bootstrap concluído"
-  clear_bootstrap_state
+  log_info "All bootstrap phases completed"
+  return 0
 }
 
-# -------------------- Enter chroot (/mnt/lfs) with resolv.conf copied --------------------
-enter_chroot(){
-  _require_root
-  if ! is_mounted "${LFS}/proc"; then
-    log_warn "LFS não está montado; monte primeiro com 'prepare' ou 'mount'"
+# -------------------- Comando: crossgen --------------------
+cmd_crossgen(){
+  if [ ! -x "$CROSSGEN" ]; then _die "crossgen module not found: $CROSSGEN"; fi
+  log_info "Running cross-toolchain generator ($CROSSGEN)"
+  "$CROSSGEN" || _die "crossgen failed"
+  # create marker
+  echo "crossgen: $(_timestamp)" > "${STATE_BASE}/cross-toolchain.state"
+  log_info "Cross-toolchain generation finished"
+}
+
+# -------------------- Comando: iso --------------------
+cmd_iso(){
+  if [ ! -x "$ISO_TOOL" ]; then _die "iso tool not found: $ISO_TOOL"; fi
+  local out="/var/tmp/porg/lfs.iso"
+  local label="LFS"
+  # parse options
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --output) out="$2"; shift 2;;
+      --label) label="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+  log_info "Generating ISO -> $out (label=$label)"
+  "$ISO_TOOL" --output "$out" --label "$label" || _die "ISO generation failed"
+  log_info "ISO created at $out"
+}
+
+# -------------------- Comando: enter (chroot) --------------------
+cmd_enter(){
+  if ! mountpoint -q "${LFS}/proc"; then
+    log_warn "LFS appears not mounted; run prepare first"
     return 1
   fi
-  # ensure resolv.conf present
-  if [ -f /etc/resolv.conf ]; then
-    cp -a /etc/resolv.conf "${LFS}/etc/resolv.conf"
-    log_info "resolv.conf copiado para chroot"
-  fi
-
-  # write a helper environment file inside chroot
-  cat > "${LFS}/root/.porg_chroot_env.sh" <<EOF
-export LFS="${LFS}"
-export LFS_TGT="${LFS_TGT}"
-export PATH="/tools/bin:/bin:/usr/bin"
-export HOME="/root"
+  if [ -f "${LFS}/root/.porg_chroot_env.sh" ]; then
+    log_info "Entering chroot $LFS"
+    chroot "$LFS" /usr/bin/env -i HOME=/root TERM="$TERM" PATH=/tools/bin:/usr/bin:/bin /bin/bash --login
+  else
+    log_warn "Chroot env not found; creating minimal env"
+    mkdir -p "${LFS}/root"
+    cat > "${LFS}/root/.porg_chroot_env.sh" <<EOF
+export LFS="$LFS"
+export PATH="/tools/bin:/usr/bin:/bin"
 EOF
-
-  log_info "Entrando no chroot ${LFS} (execute 'exit' para sair)"
-  # enter chroot with a clean environment
-  chroot "${LFS}" /usr/bin/env -i HOME=/root TERM="$TERM" PS1='(lfs chroot)\u:\w\$ ' PATH=/usr/bin:/bin:/tools/bin /bin/bash --login
+    chroot "$LFS" /usr/bin/env -i HOME=/root TERM="$TERM" PATH=/tools/bin:/usr/bin:/bin /bin/bash --login
+  fi
 }
 
-# -------------------- Clean / Umount and optional cleanup --------------------
-clean_all(){
-  _require_root
-  log_stage "Executando limpeza completa e desmontagem"
-  umount_lfs
-  # optional: remove LFS user? we won't remove it automatically
-  log_info "Limpeza concluída"
+# -------------------- Comando: prepare (mounts, user, resolv.conf) --------------------
+cmd_prepare(){
+  if [ "$(id -u)" -ne 0 ]; then _die "prepare requires root"; fi
+  log_info "Preparing LFS at $LFS (mounts, user, dirs)"
+  mkdir -p "${LFS}" "${LFS}/dev" "${LFS}/proc" "${LFS}/sys" "${LFS}/run" "${LFS}/tools" "${LFS}/sources" "${LFS}/etc"
+  if mountpoint -q "$LFS"; then log_warn "$LFS may already be mounted"; fi
+  mount --bind /dev "${LFS}/dev" || true
+  mount --bind /run "${LFS}/run" || true
+  mount -t proc proc "${LFS}/proc" || true
+  mount -t sysfs sysfs "${LFS}/sys" || true
+  mount -t devpts devpts "${LFS}/dev/pts" -o gid=5,mode=620 || true
+  if [ -f /etc/resolv.conf ]; then cp -a /etc/resolv.conf "${LFS}/etc/resolv.conf"; log_info "Copied resolv.conf into chroot"; fi
+  if ! id "$LFS_USER" >/dev/null 2>&1; then useradd -m -s /bin/bash "$LFS_USER" || log_warn "useradd failed"; fi
+  chown -R "$LFS_USER":"$LFS_USER" "${LFS}/sources" "${LFS}/tools" || true
+  # optionally run crossgen if tools absent
+  if [ ! -d "${LFS}/tools/bin" ]; then
+    log_info "No /tools found in LFS; invoking crossgen"
+    cmd_crossgen
+  fi
+  log_info "Prepare complete"
 }
 
-# -------------------- CLI / Dispatcher --------------------
+# -------------------- Comando: clean (umount safe) --------------------
+cmd_clean(){
+  if [ "$(id -u)" -ne 0 ]; then _die "clean requires root"; fi
+  log_info "Unmounting LFS (safe reverse order)"
+  targets=( "${LFS}/dev/pts" "${LFS}/dev" "${LFS}/proc" "${LFS}/sys" "${LFS}/run" )
+  for t in "${targets[@]}"; do
+    if mountpoint -q "$t"; then
+      log_info "Unmount $t"
+      umount -l "$t" 2>/dev/null || umount -f "$t" 2>/dev/null || log_warn "Failed to unmount $t"
+    fi
+  done
+  log_info "Clean complete"
+}
+
+# -------------------- Comando: tui (dialog simple) --------------------
+cmd_tui(){
+  if ! _have dialog; then log_warn "dialog not installed; install 'dialog' to use TUI"; return 1; fi
+  log_info "Starting TUI (interactive) - press ESC/Ctrl-C to quit"
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' EXIT
+  # run build in background and stream logs to dialog tailbox
+  ( cmd_build "false" ) &> "$tmp" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    dialog --title "Porg Bootstrap (TUI)" --tailbox "$tmp" 30 100
+    sleep 1
+  done
+  dialog --msgbox "Bootstrap finished (TUI)" 8 40
+}
+
+# -------------------- Dispatcher / CLI --------------------
 usage(){
   cat <<EOF
-porg_bootstrap.sh - gerenciador bootstrap LFS
-
-Uso: sudo porg_bootstrap.sh <comando> [opções]
-
-Comandos:
-  prepare         - monta /mnt/lfs, cria usuário lfs e prepara diretórios
-  build [--dry]   - compila toolchain conforme ${BOOTSTRAP_YAML}
-  enter           - entra no chroot LFS (copia resolv.conf)
-  resume <pkg|idx>- retoma bootstrap do pacote (ou index) salvo em checkpoint
-  clean           - desmonta /mnt/lfs de forma segura
-  full            - executa: prepare -> build -> enter
-  help
-
-Exemplos:
-  sudo porg_bootstrap.sh prepare
-  sudo porg_bootstrap.sh build
-  sudo porg_bootstrap.sh build --dry
-  sudo porg_bootstrap.sh enter
-  sudo porg_bootstrap.sh resume
-  sudo porg_bootstrap.sh full
+porg_bootstrap.sh - uso:
+  prepare                - montar LFS, criar usuário, copiar resolv.conf
+  list                   - listar fases do bootstrap e status
+  verify                 - verificar integridade dos checkpoints
+  rebuild <fase>         - reconstruir apenas a fase indicada
+  crossgen               - gerar cross-toolchain scripts (chamar porg_crossgen.sh)
+  build [--dry]          - executar o bootstrap completo (resume automático)
+  resume                 - continuar do último checkpoint
+  full [--tui]           - prepare -> build (se --tui usa interface)
+  enter                  - entrar no chroot
+  iso [--output file]    - gerar ISO a partir do LFS
+  clean                  - desmontar LFS
 EOF
   exit 1
 }
 
 if [ $# -lt 1 ]; then usage; fi
+_cmd="$1"; shift || true
 
-cmd="$1"; shift || true
-
-# Acquire global lock for bootstrap operations
 _acquire_lock
-
-case "$cmd" in
-  prepare)
-    _require_root
-    mount_lfs
-    create_lfs_user
-    log_info "Prepare concluído"
-    ;;
-
-  build)
-    _require_root
-    dry="false"
-    if [ "${1:-}" = "--dry" ]; then dry="true"; fi
-    build_toolchain "$dry"
-    ;;
-
-  enter)
-    enter_chroot
-    ;;
-
-  resume)
-    # resume uses saved bootstrap state; if argument provided, attempt to set index accordingly
-    arg="${1:-}"
-    if [ -n "$arg" ]; then
-      # if numeric, set index, else try to find index of package in bootstrap list
-      if [[ "$arg" =~ ^[0-9]+$ ]]; then
-        # set state index
-        idx="$arg"
-        # try to find package name for logging
-        pkg="$(get_bootstrap_list | sed -n "$((idx+1))p" 2>/dev/null || echo "")"
-        save_bootstrap_state "$idx" "$pkg"
-      else
-        # find index of package name in list
-        mapfile -t arr < <(get_bootstrap_list || true)
-        for i in "${!arr[@]}"; do
-          if [ "${arr[$i]}" = "$arg" ]; then
-            save_bootstrap_state "$i" "${arr[$i]}"
-            break
-          fi
-        done
-      fi
-    fi
-    # call build which will resume from checkpoint
-    build_toolchain "false"
-    ;;
-
-  clean)
-    _require_root
-    clean_all
-    ;;
-
+case "$_cmd" in
+  list) cmd_list ;;
+  verify) cmd_verify ;;
+  rebuild) cmd_rebuild "${1:-}" ;;
+  crossgen) cmd_crossgen ;;
+  build) cmd_build "${1:-false}" ;;
+  resume) cmd_build "false" ;;
+  prepare) cmd_prepare ;;
+  enter) cmd_enter ;;
+  clean) cmd_clean ;;
   full)
-    _require_root
-    mount_lfs
-    create_lfs_user
-    build_toolchain "false"
-    log_info "Bootstrap completo; você pode executar 'enter' para entrar no chroot"
+    tui=false
+    if [ "${1:-}" = "--tui" ]; then tui=true; fi
+    cmd_prepare
+    if [ "$tui" = true ]; then cmd_tui; else cmd_build "false"; fi
     ;;
-
-  help|*)
-    usage
-    ;;
+  iso) cmd_iso "$@" ;;
+  tui) cmd_tui ;;
+  help|--help|-h) usage ;;
+  *) usage ;;
 esac
-
 _release_lock
 exit 0
